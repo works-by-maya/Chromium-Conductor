@@ -6,3 +6,4 @@
 # Keep this file empty until a local patch is ready. forge.sh will simply note
 # that this layer is ready when you are.
 mac-audio-output-device-uid-switch.patch # add macOS audio output UID switch
+mac-audio-output-device-tab-menu.patch # add macOS tab audio output menu

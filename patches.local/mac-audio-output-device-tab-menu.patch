@@ -1,0 +1,686 @@
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -112,6 +112,18 @@ if (!is_android) {
+       "//components/feed:feature_list",
+     ]
+ 
++    if (is_mac) {
++      sources += [
++        "mac_audio_output_device_sub_menu_model.cc",
++        "mac_audio_output_device_sub_menu_model.h",
++      ]
++      deps += [ "//media" ]
++      frameworks = [
++        "CoreAudio.framework",
++        "CoreFoundation.framework",
++      ]
++    }
++
+     # TODO(crbug.com/40031409): Fix code that adds exit-time destructors and
+     # enable the diagnostic by removing this line.
+     configs += [ "//build/config/compiler:no_exit_time_destructors" ]
+--- /dev/null
++++ b/chrome/browser/ui/tabs/mac_audio_output_device_sub_menu_model.cc
+@@ -0,0 +1,217 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/mac_audio_output_device_sub_menu_model.h"
++
++#include <CoreAudio/CoreAudio.h>
++
++#include <algorithm>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/apple/scoped_cftyperef.h"
++#include "base/strings/sys_string_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "media/base/mac_audio_output_device_uid.h"
++
++namespace {
++
++constexpr size_t kMaxAudioOutputDeviceCount =
++    MacAudioOutputDeviceSubMenuModel::kMaxAudioOutputDeviceCommandId -
++    MacAudioOutputDeviceSubMenuModel::kMinAudioOutputDeviceCommandId + 1;
++
++std::optional<std::string> GetStringProperty(
++    AudioObjectID object_id,
++    AudioObjectPropertySelector selector,
++    AudioObjectPropertyScope scope) {
++  AudioObjectPropertyAddress address = {selector, scope,
++                                        kAudioObjectPropertyElementMain};
++
++  CFStringRef property_value = nullptr;
++  UInt32 size = sizeof(property_value);
++  OSStatus result = AudioObjectGetPropertyData(object_id, &address, 0, nullptr,
++                                               &size, &property_value);
++  if (result != noErr || !property_value) {
++    return std::nullopt;
++  }
++
++  base::apple::ScopedCFTypeRef<CFStringRef> scoped_property_value(
++      property_value);
++  return base::SysCFStringRefToUTF8(scoped_property_value.get());
++}
++
++std::optional<std::string> GetDeviceName(AudioObjectID device_id) {
++  std::optional<std::string> name = GetStringProperty(
++      device_id, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal);
++  if (name) {
++    return name;
++  }
++
++  return GetStringProperty(device_id, kAudioDevicePropertyDeviceNameCFString,
++                           kAudioObjectPropertyScopeOutput);
++}
++
++std::optional<std::string> GetDeviceUid(AudioObjectID device_id) {
++  return GetStringProperty(device_id, kAudioDevicePropertyDeviceUID,
++                           kAudioObjectPropertyScopeGlobal);
++}
++
++std::vector<AudioObjectID> GetAllAudioDeviceIds() {
++  AudioObjectPropertyAddress address = {kAudioHardwarePropertyDevices,
++                                        kAudioObjectPropertyScopeGlobal,
++                                        kAudioObjectPropertyElementMain};
++
++  UInt32 size = 0;
++  OSStatus result = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject,
++                                                   &address, 0, nullptr, &size);
++  if (result != noErr || size == 0) {
++    return {};
++  }
++
++  std::vector<AudioObjectID> device_ids(size / sizeof(AudioObjectID));
++  if (device_ids.empty()) {
++    return {};
++  }
++
++  result = AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0,
++                                      nullptr, &size, device_ids.data());
++  if (result != noErr) {
++    return {};
++  }
++
++  device_ids.resize(size / sizeof(AudioObjectID));
++  return device_ids;
++}
++
++bool HasOutputStreams(AudioObjectID device_id) {
++  AudioObjectPropertyAddress address = {kAudioDevicePropertyStreams,
++                                        kAudioObjectPropertyScopeOutput,
++                                        kAudioObjectPropertyElementMain};
++
++  UInt32 size = 0;
++  OSStatus result =
++      AudioObjectGetPropertyDataSize(device_id, &address, 0, nullptr, &size);
++  return result == noErr && size > 0;
++}
++
++}  // namespace
++
++MacAudioOutputDeviceSubMenuModel::MacAudioOutputDeviceSubMenuModel()
++    : ui::SimpleMenuModel(this),
++      devices_(EnumerateAudioOutputDevices()),
++      selected_device_uid_(media::GetMacAudioOutputDeviceUid()) {
++  if (devices_.size() > kMaxAudioOutputDeviceCount) {
++    devices_.resize(kMaxAudioOutputDeviceCount);
++  }
++
++  AddCheckItem(kSystemDefaultCommandId, u"System Default");
++  for (size_t i = 0; i < devices_.size(); ++i) {
++    AddCheckItem(kMinAudioOutputDeviceCommandId + i,
++                 base::UTF8ToUTF16(devices_[i].name));
++  }
++}
++
++MacAudioOutputDeviceSubMenuModel::~MacAudioOutputDeviceSubMenuModel() = default;
++
++bool MacAudioOutputDeviceSubMenuModel::IsCommandIdChecked(
++    int command_id) const {
++  const bool selected_device_available = IsSelectedDeviceAvailable();
++  if (command_id == kSystemDefaultCommandId) {
++    return selected_device_uid_.empty() || !selected_device_available;
++  }
++
++  const AudioOutputDevice* device = GetDeviceForCommandId(command_id);
++  return device && selected_device_available &&
++         device->uid == selected_device_uid_;
++}
++
++bool MacAudioOutputDeviceSubMenuModel::IsCommandIdEnabled(
++    int command_id) const {
++  return command_id == kSystemDefaultCommandId ||
++         GetDeviceForCommandId(command_id);
++}
++
++void MacAudioOutputDeviceSubMenuModel::ExecuteCommand(int command_id,
++                                                      int /*event_flags*/) {
++  if (command_id == kSystemDefaultCommandId) {
++    selected_device_uid_.clear();
++    media::SetMacAudioOutputDeviceUid(std::string());
++    return;
++  }
++
++  AudioOutputDevice* device = GetDeviceForCommandId(command_id);
++  if (!device) {
++    return;
++  }
++
++  const std::string device_uid = device->uid;
++  if (!ContainsDeviceUid(EnumerateAudioOutputDevices(), device_uid)) {
++    selected_device_uid_.clear();
++    media::SetMacAudioOutputDeviceUid(std::string());
++    return;
++  }
++
++  selected_device_uid_ = device_uid;
++  media::SetMacAudioOutputDeviceUid(device_uid);
++}
++
++// static
++std::vector<MacAudioOutputDeviceSubMenuModel::AudioOutputDevice>
++MacAudioOutputDeviceSubMenuModel::EnumerateAudioOutputDevices() {
++  std::vector<AudioOutputDevice> devices;
++  for (AudioObjectID device_id : GetAllAudioDeviceIds()) {
++    if (!HasOutputStreams(device_id)) {
++      continue;
++    }
++
++    std::optional<std::string> name = GetDeviceName(device_id);
++    std::optional<std::string> uid = GetDeviceUid(device_id);
++    if (!name || name->empty() || !uid || uid->empty() ||
++        ContainsDeviceUid(devices, *uid)) {
++      continue;
++    }
++
++    devices.push_back({std::move(*name), std::move(*uid)});
++  }
++  return devices;
++}
++
++bool MacAudioOutputDeviceSubMenuModel::IsSelectedDeviceAvailable() const {
++  return !selected_device_uid_.empty() &&
++         ContainsDeviceUid(selected_device_uid_);
++}
++
++// static
++bool MacAudioOutputDeviceSubMenuModel::ContainsDeviceUid(
++    const std::vector<AudioOutputDevice>& devices,
++    const std::string& device_uid) {
++  return std::ranges::any_of(
++      devices, [&](const auto& device) { return device.uid == device_uid; });
++}
++
++bool MacAudioOutputDeviceSubMenuModel::ContainsDeviceUid(
++    const std::string& device_uid) const {
++  return ContainsDeviceUid(devices_, device_uid);
++}
++
++MacAudioOutputDeviceSubMenuModel::AudioOutputDevice*
++MacAudioOutputDeviceSubMenuModel::GetDeviceForCommandId(int command_id) {
++  if (command_id < kMinAudioOutputDeviceCommandId ||
++      command_id > kMaxAudioOutputDeviceCommandId) {
++    return nullptr;
++  }
++
++  size_t device_index = command_id - kMinAudioOutputDeviceCommandId;
++  if (device_index >= devices_.size()) {
++    return nullptr;
++  }
++  return &devices_[device_index];
++}
++
++const MacAudioOutputDeviceSubMenuModel::AudioOutputDevice*
++MacAudioOutputDeviceSubMenuModel::GetDeviceForCommandId(int command_id) const {
++  return const_cast<MacAudioOutputDeviceSubMenuModel*>(this)
++      ->GetDeviceForCommandId(command_id);
++}
+--- /dev/null
++++ b/chrome/browser/ui/tabs/mac_audio_output_device_sub_menu_model.h
+@@ -0,0 +1,53 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_MAC_AUDIO_OUTPUT_DEVICE_SUB_MENU_MODEL_H_
++#define CHROME_BROWSER_UI_TABS_MAC_AUDIO_OUTPUT_DEVICE_SUB_MENU_MODEL_H_
++
++#include <string>
++#include <vector>
++
++#include "ui/menus/simple_menu_model.h"
++
++class MacAudioOutputDeviceSubMenuModel : public ui::SimpleMenuModel,
++                                         public ui::SimpleMenuModel::Delegate {
++ public:
++  MacAudioOutputDeviceSubMenuModel();
++  MacAudioOutputDeviceSubMenuModel(const MacAudioOutputDeviceSubMenuModel&) =
++      delete;
++  MacAudioOutputDeviceSubMenuModel& operator=(
++      const MacAudioOutputDeviceSubMenuModel&) = delete;
++  ~MacAudioOutputDeviceSubMenuModel() override;
++
++  // Command IDs used by the parent tab context menu and this submenu.
++  static constexpr int kSubMenuCommandId = 1900;
++  static constexpr int kSystemDefaultCommandId = 1901;
++  static constexpr int kMinAudioOutputDeviceCommandId = 1902;
++  static constexpr int kMaxAudioOutputDeviceCommandId = 2199;
++
++ private:
++  struct AudioOutputDevice {
++    std::string name;
++    std::string uid;
++  };
++
++  // ui::SimpleMenuModel::Delegate:
++  bool IsCommandIdChecked(int command_id) const override;
++  bool IsCommandIdEnabled(int command_id) const override;
++  void ExecuteCommand(int command_id, int event_flags) override;
++
++  static std::vector<AudioOutputDevice> EnumerateAudioOutputDevices();
++  static bool ContainsDeviceUid(const std::vector<AudioOutputDevice>& devices,
++                                const std::string& device_uid);
++
++  bool IsSelectedDeviceAvailable() const;
++  bool ContainsDeviceUid(const std::string& device_uid) const;
++  AudioOutputDevice* GetDeviceForCommandId(int command_id);
++  const AudioOutputDevice* GetDeviceForCommandId(int command_id) const;
++
++  std::vector<AudioOutputDevice> devices_;
++  std::string selected_device_uid_;
++};
++
++#endif  // CHROME_BROWSER_UI_TABS_MAC_AUDIO_OUTPUT_DEVICE_SUB_MENU_MODEL_H_
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -7,7 +7,6 @@
+ #include <memory>
+ #include <optional>
+ 
+-#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/i18n/rtl.h"
+@@ -29,6 +28,9 @@
+ #include "chrome/browser/ui/tabs/existing_window_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/glic_tab_sub_menu_model.h"
++#if BUILDFLAG(IS_MAC)
++#include "chrome/browser/ui/tabs/mac_audio_output_device_sub_menu_model.h"
++#endif
+ #include "chrome/browser/ui/tabs/split_tab_menu_model.h"
+ #include "chrome/browser/ui/tabs/split_tab_swap_menu_model.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+@@ -169,6 +171,15 @@ void TabMenuModel::BuildLegacySendTabToSelfItem() {
+ #endif
+ }
+ 
++#if BUILDFLAG(IS_MAC)
++void TabMenuModel::BuildMacAudioOutputDeviceSubmenu() {
++  mac_audio_output_device_submenu_ =
++      std::make_unique<MacAudioOutputDeviceSubMenuModel>();
++  AddSubMenu(MacAudioOutputDeviceSubMenuModel::kSubMenuCommandId,
++             u"Send Audio To", mac_audio_output_device_submenu_.get());
++}
++#endif
++
+ void TabMenuModel::Build(int index) {
+   std::vector<int> indices;
+   if (tab_strip_->IsTabSelected(index)) {
+@@ -298,6 +310,11 @@ void TabMenuModel::Build(int index) {
+                     : l10n_util::GetPluralStringFUTF16(
+                           IDS_TAB_CXMENU_SOUND_UNMUTE_SITE, num_tabs));
+ 
++#if BUILDFLAG(IS_MAC)
++  AddSeparator(ui::NORMAL_SEPARATOR);
++  BuildMacAudioOutputDeviceSubmenu();
++#endif
++
+   const bool display_read_later = tab_strip_->delegate()->SupportsReadLater();
+   const std::optional<send_tab_to_self::EntryPointDisplayReason>
+       send_tab_to_self_reason = send_tab_to_self::GetEntryPointDisplayReason(
+@@ -450,6 +467,12 @@ bool TabMenuModel::IsEnabledAt(size_t index) const {
+     return matcher->IsCommandIdEnabled(GetCommandIdAt(index));
+   }
+ #endif
++#if BUILDFLAG(IS_MAC)
++  if (GetCommandIdAt(index) ==
++      MacAudioOutputDeviceSubMenuModel::kSubMenuCommandId) {
++    return true;
++  }
++#endif
+   return ui::SimpleMenuModel::IsEnabledAt(index);
+ }
+ 
+@@ -465,6 +488,16 @@ bool TabMenuModel::IsVisibleAt(size_t index) const {
+   return ui::SimpleMenuModel::IsVisibleAt(index);
+ }
+ 
++bool TabMenuModel::IsAlertedAt(size_t index) const {
++#if BUILDFLAG(IS_MAC)
++  if (GetCommandIdAt(index) ==
++      MacAudioOutputDeviceSubMenuModel::kSubMenuCommandId) {
++    return false;
++  }
++#endif
++  return ui::SimpleMenuModel::IsAlertedAt(index);
++}
++
+ void TabMenuModel::ActivatedAt(size_t index) {
+   ActivatedAt(index, 0);
+ }
+--- a/chrome/browser/ui/tabs/tab_menu_model.h
++++ b/chrome/browser/ui/tabs/tab_menu_model.h
+@@ -8,6 +8,7 @@
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
++#include "build/build_config.h"
+ #include "extensions/buildflags/buildflags.h"
+ #include "ui/base/interaction/element_identifier.h"
+ #include "ui/menus/simple_menu_model.h"
+@@ -29,5 +29,9 @@ class TabStripModel;
+ class TabMenuModelDelegate;
+ 
++#if BUILDFLAG(IS_MAC)
++class MacAudioOutputDeviceSubMenuModel;
++#endif
++
+ // A menu model that builds the contents of the tab context menu. To make sure
+ // the menu reflects the real state of the tab a new TabMenuModel should be
+ // created each time the menu is shown.
+@@ -42,6 +47,7 @@ class TabMenuModelDelegate;
+ //   ExistingTabGroupSubMenuModel
+ //   ExistingWindowSubMenuModel
+ //   ExistingComparisonTableSubMenuModel
++//   MacAudioOutputDeviceSubMenuModel
+ class TabMenuModel : public ui::SimpleMenuModel {
+  public:
+   DECLARE_CLASS_ELEMENT_IDENTIFIER_VALUE(kAddANoteTabMenuItem);
+@@ -63,6 +69,7 @@ class TabMenuModel : public ui::SimpleMenuModel {
+   bool IsItemCheckedAt(size_t index) const override;
+   bool IsEnabledAt(size_t index) const override;
+   bool IsVisibleAt(size_t index) const override;
++  bool IsAlertedAt(size_t index) const override;
+   void ActivatedAt(size_t index) override;
+   void ActivatedAt(size_t index, int event_flags) override;
+ 
+@@ -71,6 +78,9 @@ class TabMenuModel : public ui::SimpleMenuModel {
+   void BuildForWebApp(int index);
+   void BuildSendTabToSelfSubmenu(int index);
+   void BuildLegacySendTabToSelfItem();
++#if BUILDFLAG(IS_MAC)
++  void BuildMacAudioOutputDeviceSubmenu();
++#endif
+ 
+ #if BUILDFLAG(ENABLE_EXTENSIONS)
+   // Support for appending and executing commands for extension items in the
+@@ -91,6 +101,10 @@ class TabMenuModel : public ui::SimpleMenuModel {
+   std::unique_ptr<ui::SimpleMenuModel> send_tab_to_self_submenu_;
+   std::unique_ptr<send_tab_to_self::SendTabToSelfContextMenuDelegate>
+       send_tab_to_self_submenu_delegate_;
++#if BUILDFLAG(IS_MAC)
++  std::unique_ptr<MacAudioOutputDeviceSubMenuModel>
++      mac_audio_output_device_submenu_;
++#endif
+ 
+   // `tab_strip_` needs to outlive this class.
+   raw_ptr<TabStripModel> tab_strip_;
+--- a/content/browser/renderer_host/media/render_frame_audio_output_stream_factory.cc
++++ b/content/browser/renderer_host/media/render_frame_audio_output_stream_factory.cc
+@@ -371,2 +360,1 @@
+-  const std::string preferred_device_uid =
+-      GetMacAudioOutputDeviceUidSwitchValue();
++  const std::string preferred_device_uid = media::GetMacAudioOutputDeviceUid();
+--- a/content/browser/renderer_host/media/render_frame_audio_output_stream_factory.cc
++++ b/content/browser/renderer_host/media/render_frame_audio_output_stream_factory.cc
+@@ -16,7 +16,6 @@
+ #include <utility>
+ 
+ #include "base/check_op.h"
+-#include "base/command_line.h"
+ #include "base/containers/flat_set.h"
+ #include "base/containers/unique_ptr_adapters.h"
+ #include "base/functional/bind.h"
+@@ -35,6 +34,6 @@
+ #include "media/audio/audio_device_description.h"
+ #include "media/audio/audio_system.h"
+-#include "media/base/media_switches.h"
++#include "media/base/mac_audio_output_device_uid.h"
+ #include "media/base/output_device_info.h"
+ #include "media/mojo/mojom/audio_output_stream.mojom.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+@@ -61,16 +60,6 @@ const char* OutputDeviceStatusToString(media::OutputDeviceStatus status) {
+ }
+ 
+ #if BUILDFLAG(IS_MAC)
+-std::string GetMacAudioOutputDeviceUidSwitchValue() {
+-  const base::CommandLine* command_line =
+-      base::CommandLine::ForCurrentProcess();
+-  if (!command_line->HasSwitch(switches::kMacAudioOutputDeviceUid)) {
+-    return std::string();
+-  }
+-  return command_line->GetSwitchValueUTF8(
+-      switches::kMacAudioOutputDeviceUid);
+-}
+-
+ bool ContainsOutputDeviceUid(
+     const media::AudioDeviceDescriptions& device_descriptions,
+     const std::string& device_uid) {
+--- a/content/browser/renderer_host/media/render_frame_audio_output_stream_factory_unittest.cc
++++ b/content/browser/renderer_host/media/render_frame_audio_output_stream_factory_unittest.cc
+@@ -27,6 +27,7 @@
+ #include "media/audio/fake_audio_manager.h"
+ #include "media/audio/test_audio_thread.h"
+ #include "media/base/audio_parameters.h"
++#include "media/base/mac_audio_output_device_uid.h"
+ #include "media/base/media_switches.h"
+ #include "media/mojo/mojom/audio_output_stream.mojom.h"
+ #include "media/mojo/mojom/audio_stream_factory.mojom.h"
+@@ -96,6 +97,9 @@ class RenderFrameAudioOutputStreamFactoryTest
+   void TearDown() override {
+     ForwardingAudioStreamFactory::OverrideAudioStreamFactoryBinderForTesting(
+         base::NullCallback());
++#if BUILDFLAG(IS_MAC)
++    media::ClearMacAudioOutputDeviceUidForTesting();
++#endif
+     audio_manager_.Shutdown();
+     RenderViewHostTestHarness::TearDown();
+   }
+@@ -344,6 +348,76 @@ TEST_F(RenderFrameAudioOutputStreamFactoryTest,
+   EXPECT_EQ(kDefaultDeviceId,
+             audio_service_stream_factory_.last_output_device_id());
+ }
++
++TEST_F(RenderFrameAudioOutputStreamFactoryTest,
++       MacAudioOutputDeviceUidRuntimeSelectionOverridesSwitch) {
++  base::test::ScopedCommandLine scoped_command_line;
++  scoped_command_line.GetProcessCommandLine()->AppendSwitchUTF8(
++      switches::kMacAudioOutputDeviceUid, kUnavailableOutputDeviceUid);
++  media::SetMacAudioOutputDeviceUid(kPreferredOutputDeviceUid);
++
++  mojo::Remote<blink::mojom::RendererAudioOutputStreamFactory> factory_remote;
++  RenderFrameAudioOutputStreamFactory factory(
++      main_rfh(), audio_system_.get(), media_stream_manager_.get(),
++      factory_remote.BindNewPipeAndPassReceiver());
++
++  mojo::Remote<media::mojom::AudioOutputStreamProvider> provider_remote;
++  MockAuthorizationCallback mock_callback;
++  factory_remote->RequestDeviceAuthorization(
++      provider_remote.BindNewPipeAndPassReceiver(), std::nullopt,
++      kDefaultDeviceId, mock_callback.Get());
++
++  EXPECT_CALL(mock_callback,
++              Run(media::OUTPUT_DEVICE_STATUS_OK, _, std::string()));
++
++  base::RunLoop().RunUntilIdle();
++  ASSERT_EQ(1u, factory.CurrentNumberOfProvidersForTesting());
++
++  mojo::PendingRemote<media::mojom::AudioOutputStreamProviderClient> client;
++  std::ignore = client.InitWithNewPipeAndPassReceiver();
++  provider_remote->Acquire(kParams, std::move(client));
++
++  base::RunLoop().RunUntilIdle();
++
++  EXPECT_TRUE(!!audio_service_stream_factory_.last_created_callback());
++  EXPECT_EQ(kPreferredOutputDeviceUid,
++            audio_service_stream_factory_.last_output_device_id());
++}
++
++TEST_F(RenderFrameAudioOutputStreamFactoryTest,
++       MacAudioOutputDeviceUidRuntimeSystemDefaultOverridesSwitch) {
++  base::test::ScopedCommandLine scoped_command_line;
++  scoped_command_line.GetProcessCommandLine()->AppendSwitchUTF8(
++      switches::kMacAudioOutputDeviceUid, kPreferredOutputDeviceUid);
++  media::SetMacAudioOutputDeviceUid(std::string());
++
++  mojo::Remote<blink::mojom::RendererAudioOutputStreamFactory> factory_remote;
++  RenderFrameAudioOutputStreamFactory factory(
++      main_rfh(), audio_system_.get(), media_stream_manager_.get(),
++      factory_remote.BindNewPipeAndPassReceiver());
++
++  mojo::Remote<media::mojom::AudioOutputStreamProvider> provider_remote;
++  MockAuthorizationCallback mock_callback;
++  factory_remote->RequestDeviceAuthorization(
++      provider_remote.BindNewPipeAndPassReceiver(), std::nullopt,
++      kDefaultDeviceId, mock_callback.Get());
++
++  EXPECT_CALL(mock_callback,
++              Run(media::OUTPUT_DEVICE_STATUS_OK, _, std::string()));
++
++  base::RunLoop().RunUntilIdle();
++  ASSERT_EQ(1u, factory.CurrentNumberOfProvidersForTesting());
++
++  mojo::PendingRemote<media::mojom::AudioOutputStreamProviderClient> client;
++  std::ignore = client.InitWithNewPipeAndPassReceiver();
++  provider_remote->Acquire(kParams, std::move(client));
++
++  base::RunLoop().RunUntilIdle();
++
++  EXPECT_TRUE(!!audio_service_stream_factory_.last_created_callback());
++  EXPECT_EQ(kDefaultDeviceId,
++            audio_service_stream_factory_.last_output_device_id());
++}
+ #endif  // BUILDFLAG(IS_MAC)
+ 
+ TEST_F(RenderFrameAudioOutputStreamFactoryTest,
+--- a/media/base/BUILD.gn
++++ b/media/base/BUILD.gn
+@@ -467,6 +467,11 @@ source_set("base") {
+   }
+ 
+   if (is_mac) {
++    sources += [
++      "mac_audio_output_device_uid.cc",
++      "mac_audio_output_device_uid.h",
++    ]
++
+     frameworks = [
+       "CoreVideo.framework",
+       "CoreFoundation.framework",
+--- /dev/null
++++ b/media/base/mac_audio_output_device_uid.cc
+@@ -0,0 +1,66 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "media/base/mac_audio_output_device_uid.h"
++
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "base/command_line.h"
++#include "base/no_destructor.h"
++#include "base/synchronization/lock.h"
++#include "base/thread_annotations.h"
++#include "media/base/media_switches.h"
++
++namespace media {
++
++namespace {
++
++struct MacAudioOutputDeviceUidState {
++  base::Lock lock;
++  std::optional<std::string> runtime_device_uid GUARDED_BY(lock);
++};
++
++MacAudioOutputDeviceUidState& GetState() {
++  static base::NoDestructor<MacAudioOutputDeviceUidState> state;
++  return *state;
++}
++
++std::string GetMacAudioOutputDeviceUidSwitchValue() {
++  const base::CommandLine* command_line =
++      base::CommandLine::ForCurrentProcess();
++  if (!command_line->HasSwitch(switches::kMacAudioOutputDeviceUid)) {
++    return std::string();
++  }
++  return command_line->GetSwitchValueUTF8(switches::kMacAudioOutputDeviceUid);
++}
++
++}  // namespace
++
++std::string GetMacAudioOutputDeviceUid() {
++  MacAudioOutputDeviceUidState& state = GetState();
++  {
++    base::AutoLock lock(state.lock);
++    if (state.runtime_device_uid.has_value()) {
++      return *state.runtime_device_uid;
++    }
++  }
++
++  return GetMacAudioOutputDeviceUidSwitchValue();
++}
++
++void SetMacAudioOutputDeviceUid(std::string device_uid) {
++  MacAudioOutputDeviceUidState& state = GetState();
++  base::AutoLock lock(state.lock);
++  state.runtime_device_uid = std::move(device_uid);
++}
++
++void ClearMacAudioOutputDeviceUidForTesting() {
++  MacAudioOutputDeviceUidState& state = GetState();
++  base::AutoLock lock(state.lock);
++  state.runtime_device_uid.reset();
++}
++
++}  // namespace media
+--- /dev/null
++++ b/media/base/mac_audio_output_device_uid.h
+@@ -0,0 +1,30 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef MEDIA_BASE_MAC_AUDIO_OUTPUT_DEVICE_UID_H_
++#define MEDIA_BASE_MAC_AUDIO_OUTPUT_DEVICE_UID_H_
++
++#include <string>
++
++#include "media/base/media_export.h"
++
++namespace media {
++
++// Returns the browser-wide macOS output device UID selected at runtime, falling
++// back to the --mac-audio-output-device-uid command-line switch when no runtime
++// selection has been made. An empty string means System Default.
++MEDIA_EXPORT std::string GetMacAudioOutputDeviceUid();
++
++// Sets the browser-wide macOS output device UID for subsequently created audio
++// output streams. Passing an empty string selects System Default and overrides
++// any command-line UID for the rest of the process.
++MEDIA_EXPORT void SetMacAudioOutputDeviceUid(std::string device_uid);
++
++// Clears the runtime selection so GetMacAudioOutputDeviceUid() again reflects
++// the command-line switch. Intended for tests.
++MEDIA_EXPORT void ClearMacAudioOutputDeviceUidForTesting();
++
++}  // namespace media
++
++#endif  // MEDIA_BASE_MAC_AUDIO_OUTPUT_DEVICE_UID_H_

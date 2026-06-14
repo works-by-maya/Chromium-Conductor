@@ -2,3 +2,4 @@
 # Example:
 # skip-a-feature-we-are-not-building.patch	Skip feature we are not building	This local build keeps that feature out so the browser stays aligned with the workspace's goals.
 mac-audio-output-device-uid-switch.patch	Add macOS audio output UID switch	Allows this Chromium build to route browser audio to a selected CoreAudio output device while falling back to the normal authorized/default device when unavailable.
+mac-audio-output-device-tab-menu.patch	Add macOS tab audio output menu	Adds a macOS-only Send Audio To submenu to the tab context menu, enumerates CoreAudio output devices at runtime, and stores the selected UID in a browser-wide runtime override consumed by the existing audio routing path.
