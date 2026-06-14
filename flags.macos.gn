@@ -1,0 +1,52 @@
+# === LEAN & MEAN UNGOOGLED CHROMIUM ===
+# For Apple Silicon (M4 Pro)
+# Cleaned for Chromium 144.x compatibility
+
+# ============================================
+# ARCHITECTURE
+# ============================================
+target_cpu = "arm64"
+
+# ============================================
+# BUILD TYPE - MAX OPTIMIZATION
+# ============================================
+is_debug = false
+is_official_build = true
+is_clang = true
+is_component_build = false
+
+# ============================================
+# SYMBOL STRIPPING - LEAN BINARY
+# ============================================
+symbol_level = 0
+blink_symbol_level = 0
+
+# ============================================
+# LINK-TIME OPTIMIZATION (LTO)
+# ============================================
+use_thin_lto = true
+use_lld = true
+
+# ============================================
+# CODECS - FULL MEDIA SUPPORT
+# ============================================
+ffmpeg_branding = "Chrome"
+proprietary_codecs = true
+enable_mse_mpeg2ts_stream_parser = true
+
+# ============================================
+# RUST & TOOLCHAIN
+# ============================================
+enable_rust = true
+
+# ============================================
+# DISABLE CRUFT
+# ============================================
+enable_updater = false
+use_sysroot = false
+enable_iterator_debugging = false
+
+# ============================================
+# LINKER
+# ============================================
+fatal_linker_warnings = false

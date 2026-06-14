@@ -1,0 +1,21 @@
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Local agent/editor state
+.claude/
+.codex/
+.agents/
+.vscode/
+.idea/
+*.swp
+*~
+
+# Generated logs and local build-state markers
+/out/
+*.log
+.forge-last-built-version
+
+# Managed/downloaded Chromium checkout and generated build state
+/ungoogled-chromium-macos/
