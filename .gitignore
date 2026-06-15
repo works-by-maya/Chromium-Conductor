@@ -15,10 +15,14 @@
 # Generated logs and local build-state markers
 /out/
 *.log
+.conductor-last-built-version
+# Legacy (pre-rename) marker; kept ignored during the forge.sh -> conductor.sh transition.
 .forge-last-built-version
 
 # Managed/downloaded Chromium checkout and generated build state
 /ungoogled-chromium-macos/
 
-# forge.sh staged-deletion trash (transient; lingers only if a delete could not finish)
+# conductor.sh staged-deletion trash (transient; lingers only if a delete could not finish)
+/.conductor-trash-*/
+# Legacy (pre-rename) staged-deletion trash; kept ignored in case an old run left one behind.
 /.forge-trash-*/

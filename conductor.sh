@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# forge.sh - build script for Chromium Conductor,
+# conductor.sh - build script for Chromium Conductor,
 # a lean, Apple silicon-optimized build of ungoogled-chromium-macos
 # with native, in-app Core Audio routing.
 #
@@ -27,22 +27,22 @@
 #
 # How to run it:
 #
-# ./forge.sh
+# ./conductor.sh
 #   Delete the generated checkout, and start fresh from upstream.
 #
-# ./forge.sh --check
+# ./conductor.sh --check
 #   See if a newer upstream release exists.
 #
-# ./forge.sh --verify-only
+# ./conductor.sh --verify-only
 #   Report source and build state. Delete nothing. Build nothing.
 #
-# ./forge.sh --clean
+# ./conductor.sh --clean
 #   Remove the generated checkout. Keep logs and authored files. Build nothing.
 #
-# ./forge.sh --update-build
+# ./conductor.sh --update-build
 #   Time saver: Refresh what's changed, reapply patches, and rebuild.
 #
-# ./forge.sh --help
+# ./conductor.sh --help
 #   Show this information.
 #
 #
@@ -50,7 +50,7 @@
 #
 # These files are the project:
 #
-#   forge.sh
+#   conductor.sh
 #   forge.conf
 #   version.txt
 #   flags.macos.gn
@@ -66,7 +66,7 @@
 #   ungoogled-chromium-macos/build/src/
 #   out/
 #
-# If they disappear, forge.sh will recreate them.
+# If they disappear, conductor.sh will recreate them.
 #
 #
 # How rebuilds work:
@@ -103,6 +103,12 @@ if [[ -n "${ZSH_VERSION:-}" ]]; then
     setopt NONOMATCH
 fi
 
+# Stamp the wall-clock start of this invocation as early as possible, so the
+# elapsed-time line at the end reflects the whole run (preflight included), not
+# just the compile. A Chromium build is a long sit; reporting how long it
+# actually took is a small courtesy to whoever started it and walked away.
+CONDUCTOR_START_EPOCH="$(date +%s)"
+
 SCRIPT_SELF="$0"
 if [[ -n "${BASH_VERSION:-}" ]]; then
     SCRIPT_SELF="${BASH_SOURCE[0]}"
@@ -115,7 +121,11 @@ SCRIPT_DIR="$(cd "$(dirname -- "${SCRIPT_SELF}")" && pwd)"
 CONF_FILE="${SCRIPT_DIR}/forge.conf"
 LOG_DIR="${SCRIPT_DIR}/out/logs"
 VERSION_FILE="${SCRIPT_DIR}/version.txt"
-LAST_BUILT_VERSION_FILE="${SCRIPT_DIR}/.forge-last-built-version"
+LAST_BUILT_VERSION_FILE="${SCRIPT_DIR}/.conductor-last-built-version"
+# This build script was formerly named forge.sh. Earlier runs recorded the
+# built release under the .forge- name; we read it forward so "is my build
+# current?" survives the rename. See migrate_legacy_state.
+LEGACY_LAST_BUILT_VERSION_FILE="${SCRIPT_DIR}/.forge-last-built-version"
 
 REPO_DIR="${SCRIPT_DIR}/ungoogled-chromium-macos"
 REPO_URL="https://github.com/ungoogled-software/ungoogled-chromium-macos.git"
@@ -132,9 +142,13 @@ LOCAL_PATCHES_DIR="${SCRIPT_DIR}/patches.local"
 LOCAL_PATCHES_SERIES="${LOCAL_PATCHES_DIR}/series"
 LOCAL_PATCHES_MANIFEST="${LOCAL_PATCHES_DIR}/manifest.tsv"
 
-UPDATE_BUILD_STASH_DIR="${BUILD_DIR}/.forge-update-build-stash"
+UPDATE_BUILD_STASH_DIR="${BUILD_DIR}/.conductor-update-build-stash"
 UPDATE_OUT_STASH="${UPDATE_BUILD_STASH_DIR}/out"
-SOURCE_STATE_FILE="${BUILD_DIR}/.forge-source-state"
+SOURCE_STATE_FILE="${BUILD_DIR}/.conductor-source-state"
+# Legacy (pre-rename) source-state marker. It lives inside the generated build
+# tree, so we never write or migrate it; verify-only only reads it as a
+# fallback when the new marker is absent.
+LEGACY_SOURCE_STATE_FILE="${BUILD_DIR}/.forge-source-state"
 
 RETRIEVE_SCRIPT="${REPO_DIR}/retrieve_and_unpack_resource.sh"
 SIGN_SCRIPT="${REPO_DIR}/sign_and_package_app.sh"
@@ -153,7 +167,7 @@ MODE="full"
 
 log_init() {
     mkdir -p "${LOG_DIR}"
-    LOG_FILE="${LOG_DIR}/forge_$(date +%Y%m%d_%H%M%S).log"
+    LOG_FILE="${LOG_DIR}/conductor_$(date +%Y%m%d_%H%M%S).log"
 
     # Keep the screen readable, and keep a log for later.
     # Chromium builds take a while. Memory should not have to do paperwork.
@@ -161,34 +175,64 @@ log_init() {
         exec >> "${LOG_FILE}" 2>&1
     fi
 
-    echo "[forge] started: $(date)"
-    echo "[forge] log: ${LOG_FILE}"
+    echo "[conductor] started: $(date)"
+    echo "[conductor] log: ${LOG_FILE}"
 }
 
 section() {
     echo ""
-    echo "[forge] $*"
+    echo "[conductor] $*"
 }
 
 info() {
-    echo "[forge] $*"
+    echo "[conductor] $*"
 }
 
 explain() {
-    echo "[forge] why: $*"
+    echo "[conductor] why: $*"
 }
 
 warn() {
-    echo "[forge] warning: $*" >&2
+    echo "[conductor] warning: $*" >&2
 }
 
 error() {
-    echo "[forge] error: $*" >&2
+    echo "[conductor] error: $*" >&2
     exit 1
 }
 
 success() {
-    echo "[forge] $*"
+    echo "[conductor] $*"
+}
+
+format_elapsed_since_start() {
+    # Render this invocation's runtime as a compact, human value:
+    #   under a minute      -> "42s"
+    #   under an hour       -> "12m 08s"
+    #   an hour or more     -> "3h 40m 03s"
+    # The leading unit is unpadded; smaller units are zero-padded to two digits
+    # so the tail always lines up cleanly.
+    local now elapsed h m s
+    now="$(date +%s)"
+    elapsed=$(( now - CONDUCTOR_START_EPOCH ))
+
+    # If the wall clock stepped backwards mid-run (e.g. an NTP correction),
+    # report zero rather than a confusing negative duration.
+    if (( elapsed < 0 )); then
+        elapsed=0
+    fi
+
+    h=$(( elapsed / 3600 ))
+    m=$(( (elapsed % 3600) / 60 ))
+    s=$(( elapsed % 60 ))
+
+    if (( h > 0 )); then
+        printf '%dh %02dm %02ds' "${h}" "${m}" "${s}"
+    elif (( m > 0 )); then
+        printf '%dm %02ds' "${m}" "${s}"
+    else
+        printf '%ds' "${s}"
+    fi
 }
 
 mode_description() {
@@ -240,38 +284,38 @@ print_help() {
     cat <<EOF
 Chromium Conductor
 
-forge.sh builds Chromium Conductor:
+conductor.sh builds Chromium Conductor:
 a lean, Apple silicon-optimized build of ungoogled-chromium-macos
 with native, in-app Core Audio routing.
 
 How to run it:
 
-./forge.sh
+./conductor.sh
   Delete the generated checkout, and start fresh from upstream.
 
-./forge.sh --check
+./conductor.sh --check
   See if a newer upstream release exists.
   No deleting. No patching. No building.
 
-./forge.sh --verify-only
+./conductor.sh --verify-only
   Report whether a Chromium from this tree is running, whether the source
   checkout is present and looks complete, and whether build output exists.
   No deleting. No patching. No building.
 
-./forge.sh --clean
+./conductor.sh --clean
   Remove the generated checkout (clone, build/, source, download cache).
   Keeps logs and authored files. Refuses if a Chromium from this tree is
   running, and asks for confirmation first. No patching. No building.
 
-./forge.sh --update-build
+./conductor.sh --update-build
   Time saver: Refresh what's changed, reapply patches, and rebuild.
 
-./forge.sh --help
+./conductor.sh --help
   Show this information.
 
 These files are the project:
 
-  forge.sh
+  conductor.sh
   forge.conf
   version.txt
   flags.macos.gn
@@ -285,7 +329,7 @@ These are generated or downloaded:
   ungoogled-chromium-macos/build/src/
   out/
 
-If they disappear, forge.sh will recreate them.
+If they disappear, conductor.sh will recreate them.
 
 How Chromium Conductor is built:
 
@@ -346,7 +390,7 @@ parse_args() {
             --check)
                 [[ "${MODE}" == "full" ]] || {
                     echo "Only one mode can be selected." >&2
-                    echo "Run ./forge.sh --help for usage." >&2
+                    echo "Run ./conductor.sh --help for usage." >&2
                     exit 1
                 }
                 MODE="check"
@@ -355,7 +399,7 @@ parse_args() {
             --verify-only)
                 [[ "${MODE}" == "full" ]] || {
                     echo "Only one mode can be selected." >&2
-                    echo "Run ./forge.sh --help for usage." >&2
+                    echo "Run ./conductor.sh --help for usage." >&2
                     exit 1
                 }
                 MODE="verify-only"
@@ -364,7 +408,7 @@ parse_args() {
             --clean)
                 [[ "${MODE}" == "full" ]] || {
                     echo "Only one mode can be selected." >&2
-                    echo "Run ./forge.sh --help for usage." >&2
+                    echo "Run ./conductor.sh --help for usage." >&2
                     exit 1
                 }
                 MODE="clean"
@@ -373,7 +417,7 @@ parse_args() {
             --update-build)
                 [[ "${MODE}" == "full" ]] || {
                     echo "Only one mode can be selected." >&2
-                    echo "Run ./forge.sh --help for usage." >&2
+                    echo "Run ./conductor.sh --help for usage." >&2
                     exit 1
                 }
                 MODE="update-build"
@@ -381,7 +425,7 @@ parse_args() {
                 ;;
             *)
                 echo "Unknown option: ${1}" >&2
-                echo "Run ./forge.sh --help for usage." >&2
+                echo "Run ./conductor.sh --help for usage." >&2
                 exit 1
                 ;;
         esac
@@ -469,11 +513,11 @@ assert_no_running_build_output() {
         [[ -n "${pid}" ]] || continue
         # Best-effort identity for each offending process. If it exits between
         # detection and here, ps simply prints nothing for that pid.
-        ps -o pid=,comm= -p "${pid}" 2>/dev/null | sed 's/^/[forge]   /' >&2 || true
+        ps -o pid=,comm= -p "${pid}" 2>/dev/null | sed 's/^/[conductor]   /' >&2 || true
     done <<< "${pids}"
 
     warn "Build output path: ${SRC_DIR}/out/Default"
-    warn "Quit that Chromium (and any chromedriver) launched from this tree, then run forge.sh again."
+    warn "Quit that Chromium (and any chromedriver) launched from this tree, then run conductor.sh again."
     error "Stopping before deleting a running build. Nothing was changed."
 }
 
@@ -547,7 +591,7 @@ robust_remove_tree() {
     [[ -d "${target}" ]]                 || error "Refusing to ${label}: target is not a directory: ${target}"
 
     # Unique, hidden sibling inside SCRIPT_DIR -> same volume -> atomic rename.
-    staging="${SCRIPT_DIR}/.forge-trash-$(basename "${target}")-$$-$(date +%Y%m%d_%H%M%S)"
+    staging="${SCRIPT_DIR}/.conductor-trash-$(basename "${target}")-$$-$(date +%Y%m%d_%H%M%S)"
     [[ ! -e "${staging}" ]] || error "Refusing to ${label}: staging path already exists: ${staging}"
 
     info "Staging for deletion: ${target}"
@@ -576,7 +620,7 @@ robust_remove_tree() {
   .DS_Store files as fast as rm deletes them.
   Close any Finder windows under ${SCRIPT_DIR}, let indexing settle, then delete:
     ${staging}
-  forge.sh stopped rather than leave this hidden."
+  conductor.sh stopped rather than leave this hidden."
     fi
 
     success "Cleared (${label})"
@@ -617,24 +661,32 @@ safe_remove_repo_dir() {
 
 confirm_destructive() {
     # Gate an irreversible-feeling action behind an explicit yes. Automation can
-    # set FORGE_ASSUME_YES=1 to opt in ahead of time; with no terminal and no
+    # set CONDUCTOR_ASSUME_YES=1 to opt in ahead of time; with no terminal and no
     # opt-in we refuse rather than guess, so a stray invocation cannot delete in
     # a context where nobody could answer.
     local action="${1}"
 
+    # FORGE_ASSUME_YES is the pre-rename name. Honor it as a deprecated alias so
+    # existing automation does not silently start prompting (and then fail under
+    # no terminal) after the rename, but say plainly that it is deprecated.
+    if [[ "${CONDUCTOR_ASSUME_YES:-0}" == "1" ]]; then
+        info "CONDUCTOR_ASSUME_YES=1 set; proceeding with: ${action}"
+        return 0
+    fi
     if [[ "${FORGE_ASSUME_YES:-0}" == "1" ]]; then
+        warn "FORGE_ASSUME_YES is deprecated; set CONDUCTOR_ASSUME_YES=1 instead."
         info "FORGE_ASSUME_YES=1 set; proceeding with: ${action}"
         return 0
     fi
 
     if [[ ! -t 0 ]]; then
-        error "Refusing to ${action} without confirmation: no terminal attached. Re-run interactively, or set FORGE_ASSUME_YES=1 if you are sure."
+        error "Refusing to ${action} without confirmation: no terminal attached. Re-run interactively, or set CONDUCTOR_ASSUME_YES=1 if you are sure."
     fi
 
     # stdout is teed to the log, so prompt on the terminal directly and read the
     # answer from it too.
     local reply=""
-    printf '[forge] About to %s. Type "yes" to proceed: ' "${action}" > /dev/tty
+    printf '[conductor] About to %s. Type "yes" to proceed: ' "${action}" > /dev/tty
     IFS= read -r reply < /dev/tty || reply=""
 
     if [[ "${reply}" == "yes" ]]; then
@@ -646,11 +698,11 @@ confirm_destructive() {
 
 clean_generated_state() {
     section "cleaning generated state"
-    explain "remove only what forge.sh owns and can recreate, and keep everything else"
+    explain "remove only what conductor.sh owns and can recreate, and keep everything else"
 
     # --clean deletes the generated checkout (clone + build/ + build/src + the
     # download cache) — exactly what a full rebuild deletes first. It does NOT
-    # touch authored project files (forge.sh, forge.conf, version.txt,
+    # touch authored project files (conductor.sh, forge.conf, version.txt,
     # flags.macos.gn, patches.local/), the preserved logs under out/logs, or the
     # last-built-version marker. It reuses safe_remove_repo_dir, so the same path
     # guards and the running-browser guard apply.
@@ -671,7 +723,7 @@ clean_generated_state() {
 
     safe_remove_repo_dir
 
-    success "Clean complete. Run ./forge.sh to rebuild from upstream when ready."
+    success "Clean complete. Run ./conductor.sh to rebuild from upstream when ready."
 }
 
 clone_fresh_repo() {
@@ -749,7 +801,7 @@ validate_existing_update_checkout() {
     explain "confirm update-build has an existing checkout to reuse"
 
     if [[ ! -d "${REPO_DIR}" ]] || [[ ! -d "${MAIN_REPO}" ]] || [[ ! -d "${SRC_DIR}" ]]; then
-        error "No existing checkout found. Run ./forge.sh for a full clean rebuild first."
+        error "No existing checkout found. Run ./conductor.sh for a full clean rebuild first."
     fi
 
     require_executable "${RETRIEVE_SCRIPT}"
@@ -834,7 +886,7 @@ validate_local_version_consistency() {
     from ${CONF_FILE}
   expected (version.txt):        ${marker_version}
     from ${VERSION_FILE}
-  Update one of these so both files state the same Chromium version, then run ./forge.sh again."
+  Update one of these so both files state the same Chromium version, then run ./conductor.sh again."
     fi
 
     if [[ -f "${checkout_version_file}" ]]; then
@@ -847,7 +899,7 @@ validate_local_version_consistency() {
     from ${CONF_FILE} and ${VERSION_FILE}
   detected: ${checkout_version}
     from ${checkout_version_file}
-  Update ${CONF_FILE} and ${VERSION_FILE} to match the checkout, or refresh the checkout to match the declared version, before running ./forge.sh again."
+  Update ${CONF_FILE} and ${VERSION_FILE} to match the checkout, or refresh the checkout to match the declared version, before running ./conductor.sh again."
         fi
     else
         info "No local checkout version file at ${checkout_version_file}; nothing to compare against"
@@ -861,7 +913,7 @@ check_for_update() {
     explain "read-only check: ask GitHub for latest release and compare it with the last successful build"
 
     # Remote means the latest upstream ungoogled-chromium-macos release.
-    # Local means .forge-last-built-version when it exists, because that file is
+    # Local means .conductor-last-built-version when it exists, because that file is
     # written only after a successful build. If there is no build marker yet,
     # fall back to version.txt; that can compare Chromium versions, but not
     # wrapper-only release suffixes like -1.1 vs -1.2.
@@ -904,7 +956,7 @@ check_for_update() {
     info ""
 
     if [[ -z "${local_version}" ]]; then
-        info "Status: no local build recorded yet. Run ./forge.sh to produce one."
+        info "Status: no local build recorded yet. Run ./conductor.sh to produce one."
         return
     fi
 
@@ -915,14 +967,14 @@ check_for_update() {
             success "Status: current: ${LATEST_TAG}"
         else
             info "Status: update available: upstream ${LATEST_TAG}, local ${local_tag}"
-            info "Run ./forge.sh to rebuild against the latest release."
+            info "Run ./conductor.sh to rebuild against the latest release."
         fi
     else
         if [[ "${local_version}" == "${LATEST_VERSION}" ]]; then
             success "Status: current at Chromium ${LATEST_VERSION} (version-only match)."
         else
             info "Status: update available. Upstream Chromium ${LATEST_VERSION} differs from local ${local_version}."
-            info "Run ./forge.sh to rebuild against the latest release."
+            info "Run ./conductor.sh to rebuild against the latest release."
         fi
     fi
 }
@@ -1181,7 +1233,7 @@ delete_build_state() {
     if [[ -e "${BUILD_DIR}" ]]; then
         warn "Remaining build tree after cleanup:"
         report_tree_sample "${BUILD_DIR}"
-        error "Could not fully clear ${BUILD_DIR}. Close any Finder windows or other processes touching that tree and run ./forge.sh again."
+        error "Could not fully clear ${BUILD_DIR}. Close any Finder windows or other processes touching that tree and run ./conductor.sh again."
     fi
 
     # Python bytecode caches are generated; remove them so a stale .pyc can never
@@ -1353,7 +1405,7 @@ assert_source_fully_patched() {
 
     if [[ "${rej_count}" != "0" ]]; then
         warn "Found ${rej_count} rejected patch hunk file(s) under ${SRC_DIR}:"
-        printf '%s\n' "${rej_files}" | sed 's/^/[forge]   rej: /' >&2
+        printf '%s\n' "${rej_files}" | sed 's/^/[conductor]   rej: /' >&2
         error "Source is half-patched. Refusing to build. Refresh the failing patch(es), then rerun."
     fi
 
@@ -1490,7 +1542,7 @@ verify_outputs() {
 
 record_built_version() {
     # Stamp the release tag whose artifacts just passed verify_outputs. This is
-    # the marker ./forge.sh --check reads to answer "is my local build current?"
+    # the marker ./conductor.sh --check reads to answer "is my local build current?"
     # The full tag is stored (not just the Chromium version) so wrapper-only
     # revisions like -1.1 -> -1.2 register as updates even when Chromium itself
     # has not moved.
@@ -1520,7 +1572,7 @@ verify_source_and_build_state() {
         local pid
         while IFS= read -r pid; do
             [[ -n "${pid}" ]] || continue
-            ps -o pid=,comm= -p "${pid}" 2>/dev/null | sed 's/^/[forge]   /' || true
+            ps -o pid=,comm= -p "${pid}" 2>/dev/null | sed 's/^/[conductor]   /' || true
         done <<< "${running_pids}"
         warn "Quit it before a full or update-build run, or those runs will stop."
         issues=$((issues + 1))
@@ -1565,7 +1617,7 @@ verify_source_and_build_state() {
         rej_count="$(printf '%s' "${rej_files}" | grep -c . || true)"
         if [[ "${rej_count}" != "0" ]]; then
             warn "  half-patched: ${rej_count} leftover .rej file(s) found"
-            printf '%s\n' "${rej_files}" | sed 's/^/[forge]   rej: /'
+            printf '%s\n' "${rej_files}" | sed 's/^/[conductor]   rej: /'
             issues=$((issues + 1))
         else
             info "  no failed-patch (.rej) files"
@@ -1574,10 +1626,15 @@ verify_source_and_build_state() {
         info "Generated source: absent (${SRC_DIR})"
     fi
 
-    # 4. Source-state marker, written only after a clean source prep.
+    # 4. Source-state marker, written only after a clean source prep. Fall back
+    #    to the legacy .forge- marker (read-only) so a checkout produced by the
+    #    pre-rename script still reports its source state.
     if [[ -f "${SOURCE_STATE_FILE}" ]]; then
         info "Source-state marker: ${SOURCE_STATE_FILE}"
-        sed 's/^/[forge]   /' < "${SOURCE_STATE_FILE}"
+        sed 's/^/[conductor]   /' < "${SOURCE_STATE_FILE}"
+    elif [[ -f "${LEGACY_SOURCE_STATE_FILE}" ]]; then
+        info "Source-state marker: ${LEGACY_SOURCE_STATE_FILE} (legacy .forge- name; will be rewritten as ${SOURCE_STATE_FILE} on next build)"
+        sed 's/^/[conductor]   /' < "${LEGACY_SOURCE_STATE_FILE}"
     else
         info "Source-state marker: absent (last source prep did not finish, or no run yet)"
     fi
@@ -1610,6 +1667,29 @@ verify_source_and_build_state() {
     return 1
 }
 
+migrate_legacy_state() {
+    # This script was formerly forge.sh and kept its state under .forge- names.
+    # On first run after the rename, carry the persistent built-version marker
+    # forward so ./conductor.sh --check still knows what the last successful
+    # build was. We COPY, never move: the legacy file is left in place so an
+    # older forge.sh, if ever run again, still finds its own marker. Only the
+    # root-level marker is migrated; the source-state marker lives inside the
+    # generated build tree and is handled read-only where it is consumed.
+    if [[ -f "${LEGACY_LAST_BUILT_VERSION_FILE}" && ! -e "${LAST_BUILT_VERSION_FILE}" ]]; then
+        section "migrating legacy state"
+        explain "carry the pre-rename built-version marker forward without deleting the original"
+        if cp -p "${LEGACY_LAST_BUILT_VERSION_FILE}" "${LAST_BUILT_VERSION_FILE}"; then
+            info "Copied ${LEGACY_LAST_BUILT_VERSION_FILE}"
+            info "    -> ${LAST_BUILT_VERSION_FILE} (legacy original kept)"
+        else
+            # Loud, not fatal: a missing marker only makes --check fall back to
+            # version.txt, so a failed copy must not block a build.
+            warn "Could not migrate ${LEGACY_LAST_BUILT_VERSION_FILE} to ${LAST_BUILT_VERSION_FILE}."
+            warn "Continuing without a built-version marker; --check will fall back to version.txt."
+        fi
+    fi
+}
+
 main() {
     parse_args "$@"
     log_init
@@ -1618,6 +1698,7 @@ main() {
 
     section "preflight"
     validate_host_layout
+    migrate_legacy_state
     load_config
     validate_local_version_consistency
 
@@ -1629,7 +1710,7 @@ main() {
             # No checkout refresh, no patching, no build.
             check_for_update
             section "done"
-            success "Forge check complete."
+            success "Conductor check complete."
             ;;
         verify-only)
             # --verify-only is read-only:
@@ -1647,11 +1728,11 @@ main() {
             ;;
         clean)
             # --clean is destructive but guarded: it removes only the generated
-            # checkout forge.sh owns, after the running-browser guard and an
+            # checkout conductor.sh owns, after the running-browser guard and an
             # explicit confirmation. Logs and authored files are preserved.
             clean_generated_state
             section "done"
-            success "Forge clean complete."
+            success "Conductor clean complete."
             ;;
         full)
             print_run_config
@@ -1683,6 +1764,7 @@ main() {
 
             section "done"
             success "Full rebuild complete: ${LATEST_TAG}"
+            info "Build completed in $(format_elapsed_since_start)"
             ;;
         update-build)
             print_run_config
@@ -1710,6 +1792,7 @@ main() {
 
             section "done"
             success "Update-build complete: ${LATEST_TAG}"
+            info "Build completed in $(format_elapsed_since_start)"
             ;;
         *)
             error "Internal error: unknown mode '${MODE}'"
