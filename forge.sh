@@ -1,56 +1,100 @@
 #!/usr/bin/env bash
-# forge.sh - Cozy, direct rebuild script for ungoogled-chromium macOS.
 #
-# Usage:
-#   ./forge.sh
+# forge.sh - build script for Chromium Conductor,
+# a lean, Apple silicon-optimized build of ungoogled-chromium-macos
+# with native, in-app Core Audio routing.
 #
-# Help:
-#   ./forge.sh -h
-#   ./forge.sh --help
 #
-# Assumptions for this particular local build workspace:
-#   - This script lives at the root of the wrapper project directory.
-#   - All project paths are resolved from the directory containing this script,
-#     so the workspace can live anywhere on disk.
-#   - forge.conf, version.txt, and flags.macos.gn are the local authored control
-#     files for this build. They live beside this script, outside the checkout
-#     that gets refreshed every run.
-#   - ungoogled-chromium-macos/ is a managed checkout that this script owns. It
-#     gets recreated from upstream whenever ./forge.sh runs.
-#   - build/ under that managed checkout is generated state. Nothing in that
-#     directory is hand-authored; it is made by the build and safe to clear.
-#   - patches.local/ is the local custom patch layer. It lives outside the
-#     refreshed checkout so local choices stay with this workspace.
-#   - Full Xcode, Homebrew tooling, Python, git, curl, greadlink, and ninja are
-#     already installed and available to this shell.
-#   - Network access is expected. This script clones the small macOS wrapper
-#     repo, then downloads the official Chromium source archive plus platform
-#     toolchain resources. It intentionally does not use Chromium's heavier
-#     gclient clone path for source retrieval.
+# The details:
 #
-# Rebuild philosophy:
-#   This script is deliberately direct. A clean rebuild should begin from inputs
-#   it can explain: a newly cloned wrapper repo, a published release tag, known
-#   source archives, and local files that live beside this script. Running
-#   ./forge.sh means: refresh the managed checkout, pin it to the latest release
-#   tag, restore build inputs from known release archives, generate build files,
-#   and build.
+# Chromium Conductor starts with ungoogled-chromium-macos, pulled straight
+# from the upstream GitHub repository:
 #
-# Patch philosophy:
-#   Patches should be named little choices, not surprises. Upstream
-#   ungoogled-chromium patches remove the big Google integration surface. macOS
-#   patches make that source build correctly on this platform. Local custom
-#   patches are where workspace preferences live; every local patch should have
-#   a plain-English note in patches.local/manifest.tsv so the terminal can teach
-#   while it builds.
+#   https://github.com/ungoogled-software/ungoogled-chromium-macos
+#
+# Afterward, local patches are added:
+#
+# Core Audio routing:
+#   Each tab can be routed to the audio output device of your choice:
+#   display speakers, an external DAC, computer speakers, etc.
+#
+# Lean Apple silicon build profile:
+#   Built for Apple silicon with my preferred optimized build settings.
+#
+# The whole point is simple:
+# Keep Chromium fast, lean, and in control of where audio goes.
+#
+#
+# How to run it:
+#
+# ./forge.sh
+#   Delete the generated checkout, and start fresh from upstream.
+#
+# ./forge.sh --check
+#   See if a newer upstream release exists.
+#
+# ./forge.sh --verify-only
+#   Report source and build state. Delete nothing. Build nothing.
+#
+# ./forge.sh --clean
+#   Remove the generated checkout. Keep logs and authored files. Build nothing.
+#
+# ./forge.sh --update-build
+#   Time saver: Refresh what's changed, reapply patches, and rebuild.
+#
+# ./forge.sh --help
+#   Show this information.
+#
+#
+# What matters:
+#
+# These files are the project:
+#
+#   forge.sh
+#   forge.conf
+#   version.txt
+#   flags.macos.gn
+#   patches.local/
+#
+# If these files change, Chromium Conductor changes.
+#
+# What can be recreated:
+#
+# These are generated or downloaded:
+#
+#   ungoogled-chromium-macos/
+#   ungoogled-chromium-macos/build/src/
+#   out/
+#
+# If they disappear, forge.sh will recreate them.
+#
+#
+# How rebuilds work:
+#
+# Full rebuilds start from a fresh upstream release.
+#
+# update-build keeps what is safe to keep, updates what needs refreshing,
+# reapplies patches, and rebuilds.
+#
+# Do not patch over an already-patched tree.
+# Refresh generated source first, then apply patches cleanly.
+#
+# How patches work:
+#
+# Upstream patches make Chromium less Google-y.
+#
+# macOS patches make Chromium build correctly on macOS.
+#
+# patches.local/ is where Chromium Conductor actually lives.
 #
 # Safety boundary:
-#   Power-user rebuilds still get a tidy workbench. Cleanup is limited to the
-#   project-owned managed checkout and its generated build state. This script
-#   does not touch home directories, system folders, mounted-volume roots,
-#   credentials, SSH keys, logs, this script, forge.conf, version.txt, or
-#   flags.macos.gn. The path checks are quiet rails, not pause-and-ask steps:
-#   they keep the cleanup boundary inside this project.
+#
+# This script only cleans up things it owns.
+#
+# It should never touch your home folder, mounted drives, SSH keys,
+# credentials, or anything else outside this project.
+#
+# The path checks exist to keep it that way.
 #
 set -euo pipefail
 
@@ -88,6 +132,10 @@ LOCAL_PATCHES_DIR="${SCRIPT_DIR}/patches.local"
 LOCAL_PATCHES_SERIES="${LOCAL_PATCHES_DIR}/series"
 LOCAL_PATCHES_MANIFEST="${LOCAL_PATCHES_DIR}/manifest.tsv"
 
+UPDATE_BUILD_STASH_DIR="${BUILD_DIR}/.forge-update-build-stash"
+UPDATE_OUT_STASH="${UPDATE_BUILD_STASH_DIR}/out"
+SOURCE_STATE_FILE="${BUILD_DIR}/.forge-source-state"
+
 RETRIEVE_SCRIPT="${REPO_DIR}/retrieve_and_unpack_resource.sh"
 SIGN_SCRIPT="${REPO_DIR}/sign_and_package_app.sh"
 
@@ -101,15 +149,14 @@ ARCH_RESOURCE=""
 VERSION=""
 LATEST_TAG=""
 LATEST_VERSION=""
-CHECK_ONLY=""
+MODE="full"
 
 log_init() {
     mkdir -p "${LOG_DIR}"
     LOG_FILE="${LOG_DIR}/forge_$(date +%Y%m%d_%H%M%S).log"
 
-    # Keep the console readable while also preserving an audit trail. Chromium
-    # builds are long enough that "what happened eight hours ago?" should be
-    # answerable from a log file, not memory.
+    # Keep the screen readable, and keep a log for later.
+    # Chromium builds take a while. Memory should not have to do paperwork.
     if ! exec > >(tee -a "${LOG_FILE}") 2>&1; then
         exec >> "${LOG_FILE}" 2>&1
     fi
@@ -144,6 +191,34 @@ success() {
     echo "[forge] $*"
 }
 
+mode_description() {
+    case "${MODE}" in
+        full)
+            echo "full clean rebuild"
+            ;;
+        check)
+            echo "version check only"
+            ;;
+        verify-only)
+            echo "verify-only: report source/build state, change nothing"
+            ;;
+        clean)
+            echo "clean: remove generated checkout, keep logs and authored files"
+            ;;
+        update-build)
+            echo "update-build: refresh, patch, rebuild"
+            ;;
+        *)
+            echo "unknown"
+            ;;
+    esac
+}
+
+print_mode() {
+    section "mode"
+    info "Mode: $(mode_description)"
+}
+
 print_shell_telemetry() {
     if [[ "${DEBUG:-0}" != "1" ]] && [[ "${VERBOSE:-0}" != "1" ]]; then
         return
@@ -163,87 +238,67 @@ print_shell_telemetry() {
 
 print_help() {
     cat <<EOF
-Usage:
-  ./forge.sh
+Chromium Conductor
 
-Update check (no cleanup, no checkout refresh, no build):
-  ./forge.sh --check
-    Validates the workbench, confirms local version files agree, then queries
-    the ungoogled-chromium-macos GitHub releases API for the latest tag and
-    compares it against the last verified local build (recorded in
-    .forge-last-built-version on every successful ./forge.sh run). Prints
-    "current" or "update available" and exits 0 either way; nonzero only on
-    actual errors (missing tools, network failure, inconsistent local files).
+forge.sh builds Chromium Conductor:
+a lean, Apple silicon-optimized build of ungoogled-chromium-macos
+with native, in-app Core Audio routing.
 
-Help:
-  ./forge.sh -h
-  ./forge.sh --help
+How to run it:
 
-What this script does:
-  forge.sh is the one-button local rebuild script for this ungoogled-chromium
-  macOS build workspace. It assumes you want a freshly refreshed checkout every
-  time you run it, with the local recipe files kept beside this script.
+./forge.sh
+  Delete the generated checkout, and start fresh from upstream.
 
-What it applies to:
-  Paths are resolved at runtime from the directory containing forge.sh, so this
-  workspace can live anywhere on disk.
+./forge.sh --check
+  See if a newer upstream release exists.
+  No deleting. No patching. No building.
 
-  Script directory:
-    ${SCRIPT_DIR}
+./forge.sh --verify-only
+  Report whether a Chromium from this tree is running, whether the source
+  checkout is present and looks complete, and whether build output exists.
+  No deleting. No patching. No building.
 
-  Repo checkout managed by this script:
-    ${REPO_DIR}
+./forge.sh --clean
+  Remove the generated checkout (clone, build/, source, download cache).
+  Keeps logs and authored files. Refuses if a Chromium from this tree is
+  running, and asks for confirmation first. No patching. No building.
 
-  Upstream macOS repo:
-    ${REPO_URL}
+./forge.sh --update-build
+  Time saver: Refresh what's changed, reapply patches, and rebuild.
 
-What happens when you run ./forge.sh:
-  1. Validate host tools, local helper files, and local version markers.
-  2. Clear the existing managed ungoogled-chromium-macos checkout.
-  3. Clone a newly refreshed ungoogled-chromium-macos checkout.
-  4. Fetch the latest release metadata from GitHub.
-  5. Update forge.conf and version.txt to the latest Chromium version.
-  6. Check out the latest release tag and initialize submodules.
-  7. Clear generated build state inside the refreshed checkout.
-  8. Download and unpack the Chromium source archive and resources.
-  9. Apply ungoogled-chromium patches, macOS patches, local custom patches,
-     and domain substitutions.
-  10. Generate args.gn from upstream flags plus flags.macos.gn.
-  11. Download platform-specific LLVM, Rust, and Node resources.
-  12. Bootstrap GN, build bindgen, generate build files, and run Ninja.
-  13. Build Chromium.app and chromedriver.
-  14. Sign/package only if MACOS_CERTIFICATE_NAME is configured.
-  15. Verify Chromium.app and chromedriver exist.
+./forge.sh --help
+  Show this information.
 
-Local custom patches:
-  Local patches live beside this script, outside the checkout that gets
-  refreshed every run, so your workspace choices stay easy to find:
-    ${LOCAL_PATCHES_DIR}
+These files are the project:
 
-  Add patch filenames to:
-    ${LOCAL_PATCHES_SERIES}
+  forge.sh
+  forge.conf
+  version.txt
+  flags.macos.gn
+  patches.local/
 
-  Explain each patch in tab-separated plain English:
-    ${LOCAL_PATCHES_MANIFEST}
+If these files change, Chromium Conductor changes.
 
-What gets refreshed:
-  Local changes inside the managed checkout are intentionally cleared:
-    ${REPO_DIR}
+These are generated or downloaded:
 
-What stays beside the script:
-  The script, config, version file, macOS flags, and logs stay outside the
-  managed checkout cleanup:
-    ${SCRIPT_DIR}/forge.sh
-    ${CONF_FILE}
-    ${VERSION_FILE}
-    ${FLAGS_MACOS}
-    ${LOG_DIR}
+  ungoogled-chromium-macos/
+  ungoogled-chromium-macos/build/src/
+  out/
 
-Notes:
-  Ninja jobs are chosen automatically using a conservative CPU-based default
-  suitable for unattended or overnight builds.
-  The repo refresh still has exact-path rails and stops before cleanup if the
-  target path is not exactly the expected checkout directory.
+If they disappear, forge.sh will recreate them.
+
+How Chromium Conductor is built:
+
+  Upstream patches make Chromium less Google-y.
+  macOS patches make Chromium build correctly on macOS.
+  patches.local/ is where Chromium Conductor actually lives.
+
+Safety boundary:
+
+  This script only cleans up things it owns.
+  It should never touch your home folder, mounted drives,
+  SSH keys, credentials, or anything else outside this project.
+
 EOF
 }
 
@@ -281,21 +336,53 @@ get_default_jobs() {
 parse_args() {
     JOBS="$(get_default_jobs)"
 
-    # There is intentionally no build-mode menu here. ./forge.sh is the build.
-    # Help is allowed because documentation should be close at hand. --check is
-    # a read-only preflight that runs validation and exits without touching the
-    # workspace. Any other option exits before workspace cleanup begins.
+    # Mode selection happens before logging or cleanup. Unknown options stop
+    # here so a typo cannot accidentally start a destructive full rebuild.
     while [[ $# -gt 0 ]]; do
         case "${1}" in
             -h|--help)
                 show_help_and_exit
                 ;;
             --check)
-                CHECK_ONLY=1
+                [[ "${MODE}" == "full" ]] || {
+                    echo "Only one mode can be selected." >&2
+                    echo "Run ./forge.sh --help for usage." >&2
+                    exit 1
+                }
+                MODE="check"
+                shift
+                ;;
+            --verify-only)
+                [[ "${MODE}" == "full" ]] || {
+                    echo "Only one mode can be selected." >&2
+                    echo "Run ./forge.sh --help for usage." >&2
+                    exit 1
+                }
+                MODE="verify-only"
+                shift
+                ;;
+            --clean)
+                [[ "${MODE}" == "full" ]] || {
+                    echo "Only one mode can be selected." >&2
+                    echo "Run ./forge.sh --help for usage." >&2
+                    exit 1
+                }
+                MODE="clean"
+                shift
+                ;;
+            --update-build)
+                [[ "${MODE}" == "full" ]] || {
+                    echo "Only one mode can be selected." >&2
+                    echo "Run ./forge.sh --help for usage." >&2
+                    exit 1
+                }
+                MODE="update-build"
                 shift
                 ;;
             *)
-                usage
+                echo "Unknown option: ${1}" >&2
+                echo "Run ./forge.sh --help for usage." >&2
+                exit 1
                 ;;
         esac
     done
@@ -336,13 +423,66 @@ is_git_worktree() {
     git -C "${repo_dir}" rev-parse --git-dir >/dev/null 2>&1
 }
 
-validate_host_layout() {
-    section "checking the workbench"
-    explain "make sure the machine and local recipe files are ready before the checkout is refreshed"
+# ---------------------------------------------------------------------------
+# Running-build detection
+#
+# The build emits Chromium.app and chromedriver under ${SRC_DIR}/out/Default,
+# and that tree usually lives on an external volume. If a browser launched from
+# there is still running when we delete the tree, the process keeps its open
+# files in memory while its on-disk resources vanish underneath it: audio and
+# already-loaded pages keep working, but normal browsing breaks, and the delete
+# itself fails halfway with "Directory not empty". That is the ghost we refuse
+# to create. Detect it, then stop before touching anything.
+# ---------------------------------------------------------------------------
+running_build_output_pids() {
+    # Everything this build can launch lives under ${SRC_DIR}/out/Default, so a
+    # process whose command line references that path is a browser or
+    # chromedriver from this tree. We snapshot the process table first, then
+    # match in memory, so neither ps nor grep can match its own command line.
+    # grep -F is a literal match, so a path containing dots or other characters
+    # can never be misread as a regular expression. argv strings persist even
+    # after a binary is unlinked, so this also catches a half-deleted ghost from
+    # an earlier interrupted run.
+    local needle="${SRC_DIR}/out/Default"
+    local snapshot
+    snapshot="$(ps -A -ww -o pid= -o command=)"
 
-    # Check the local workbench before touching the managed checkout. If a tool
-    # or local recipe file is missing, stopping here keeps the rebuild tidy and
-    # easy to understand.
+    # grep exits 1 when nothing matches. Here that is the normal "nothing is
+    # running" case, not a failure, so it is allowed to pass through.
+    printf '%s\n' "${snapshot}" | grep -F -- "${needle}" | awk '{print $1}' || true
+}
+
+assert_no_running_build_output() {
+    local context="${1}"
+    local pids
+    pids="$(running_build_output_pids)"
+
+    if [[ -z "${pids}" ]]; then
+        return 0
+    fi
+
+    warn "Refusing to ${context}."
+    warn "A Chromium built from this tree is still running:"
+
+    local pid
+    while IFS= read -r pid; do
+        [[ -n "${pid}" ]] || continue
+        # Best-effort identity for each offending process. If it exits between
+        # detection and here, ps simply prints nothing for that pid.
+        ps -o pid=,comm= -p "${pid}" 2>/dev/null | sed 's/^/[forge]   /' >&2 || true
+    done <<< "${pids}"
+
+    warn "Build output path: ${SRC_DIR}/out/Default"
+    warn "Quit that Chromium (and any chromedriver) launched from this tree, then run forge.sh again."
+    error "Stopping before deleting a running build. Nothing was changed."
+}
+
+validate_host_layout() {
+    section "checking local files"
+    explain "make sure the machine and project files are ready before anything changes"
+
+    # Check tools and authored project files before touching generated state.
+    # If something is missing, stop early and say so plainly.
     require_command curl
     require_command git
     require_command greadlink
@@ -364,8 +504,8 @@ validate_host_layout() {
 }
 
 validate_repo_layout() {
-    section "checking refreshed repo layout"
-    explain "confirm the new checkout has the helper scripts and git metadata this workflow depends on"
+    section "checking upstream checkout"
+    explain "confirm the fresh checkout has the helper scripts this build needs"
 
     # After cloning, validate the exact upstream shape we depend on. This keeps
     # upstream layout changes near the top of the log instead of hiding them
@@ -375,9 +515,9 @@ validate_repo_layout() {
 
     is_git_worktree "${REPO_DIR}" || error "Expected a git checkout at ${REPO_DIR}"
 
-    info "Repo directory: ${REPO_DIR}"
+    info "Upstream checkout: ${REPO_DIR}"
     info "Retrieve script: ${RETRIEVE_SCRIPT}"
-    success "Repo directory is a git worktree"
+    success "Upstream checkout is ready"
 }
 
 safe_remove_repo_dir() {
@@ -385,9 +525,8 @@ safe_remove_repo_dir() {
     local expected="${SCRIPT_DIR}/ungoogled-chromium-macos"
     local target_basename
 
-    # These checks are quiet rails. The script is allowed to refresh exactly one
-    # directory: the managed checkout beside this file. If the workspace shape
-    # is different, stop before cleanup starts.
+    # Full rebuild may delete the generated checkout, but only this exact path.
+    # If the project shape is not what we expect, stop before anything is deleted.
     [[ -n "${target}" ]] || error "Stopping before repo cleanup: target path is empty."
     [[ "${target}" = /* ]] || error "Stopping before repo cleanup: target path is not absolute: ${target}"
     [[ "${target}" != "/" ]] || error "Stopping before repo cleanup: target path is /."
@@ -399,23 +538,84 @@ safe_remove_repo_dir() {
     [[ ! -e "${target}" || -d "${target}" ]] || error "Stopping before repo cleanup: target exists but is not a directory: ${target}"
 
     if [[ ! -e "${target}" ]]; then
-        info "No existing managed checkout to clear: ${target}"
+        info "No generated checkout to clear: ${target}"
         return
     fi
 
-    info "Clearing managed checkout: ${target}"
+    # Never delete a tree a live browser is still running from.
+    assert_no_running_build_output "delete the generated checkout"
+
+    info "Clearing generated checkout: ${target}"
     rm -rf "${target}"
 
     [[ ! -e "${target}" ]] || error "Could not finish repo cleanup: ${target}"
-    success "Managed checkout cleared: ${target}"
+    success "Generated checkout cleared: ${target}"
+}
+
+confirm_destructive() {
+    # Gate an irreversible-feeling action behind an explicit yes. Automation can
+    # set FORGE_ASSUME_YES=1 to opt in ahead of time; with no terminal and no
+    # opt-in we refuse rather than guess, so a stray invocation cannot delete in
+    # a context where nobody could answer.
+    local action="${1}"
+
+    if [[ "${FORGE_ASSUME_YES:-0}" == "1" ]]; then
+        info "FORGE_ASSUME_YES=1 set; proceeding with: ${action}"
+        return 0
+    fi
+
+    if [[ ! -t 0 ]]; then
+        error "Refusing to ${action} without confirmation: no terminal attached. Re-run interactively, or set FORGE_ASSUME_YES=1 if you are sure."
+    fi
+
+    # stdout is teed to the log, so prompt on the terminal directly and read the
+    # answer from it too.
+    local reply=""
+    printf '[forge] About to %s. Type "yes" to proceed: ' "${action}" > /dev/tty
+    IFS= read -r reply < /dev/tty || reply=""
+
+    if [[ "${reply}" == "yes" ]]; then
+        return 0
+    fi
+
+    error "Not confirmed (got '${reply}'); nothing was changed."
+}
+
+clean_generated_state() {
+    section "cleaning generated state"
+    explain "remove only what forge.sh owns and can recreate, and keep everything else"
+
+    # --clean deletes the generated checkout (clone + build/ + build/src + the
+    # download cache) — exactly what a full rebuild deletes first. It does NOT
+    # touch authored project files (forge.sh, forge.conf, version.txt,
+    # flags.macos.gn, patches.local/), the preserved logs under out/logs, or the
+    # last-built-version marker. It reuses safe_remove_repo_dir, so the same path
+    # guards and the running-browser guard apply.
+    info "Will remove: ${REPO_DIR}"
+    info "             (generated clone, build/, build/src, and download cache)"
+    info "Will keep:   authored files, logs under ${LOG_DIR}, and ${LAST_BUILT_VERSION_FILE}"
+
+    if [[ ! -e "${REPO_DIR}" ]]; then
+        success "Nothing to clean: ${REPO_DIR} does not exist."
+        return 0
+    fi
+
+    # Refuse early and clearly if a browser from this tree is still running, so
+    # the confirmation prompt is never even shown for an unsafe delete.
+    assert_no_running_build_output "clean the generated checkout"
+
+    confirm_destructive "delete the generated checkout at ${REPO_DIR}"
+
+    safe_remove_repo_dir
+
+    success "Clean complete. Run ./forge.sh to rebuild from upstream when ready."
 }
 
 clone_fresh_repo() {
-    # The checkout is refreshed by design. Re-cloning gives this run a clean
-    # wrapper repo before we pin it to the published release tag and restore the
-    # source archive.
-    explain "start from a newly cloned macOS wrapper repo so this build begins from a known place"
-    info "Cloning refreshed repo from ${REPO_URL}"
+    # Full rebuild starts with a fresh upstream wrapper checkout before source,
+    # resources, and patches are restored.
+    explain "clone upstream again so the rebuild starts from a known place"
+    info "Cloning upstream repo from ${REPO_URL}"
     info "Clone destination: ${REPO_DIR}"
 
     [[ ! -e "${REPO_DIR}" ]] || error "Stopping before clone: destination already exists: ${REPO_DIR}"
@@ -442,6 +642,76 @@ guard_build_delete_target() {
 
     target_basename="$(basename "${target}")"
     [[ "${target_basename}" == "build" ]] || error "Stopping before build cleanup: unexpected basename ${target_basename}"
+}
+
+guard_src_delete_target() {
+    local target="${SRC_DIR}"
+    local expected="${SCRIPT_DIR}/ungoogled-chromium-macos/build/src"
+    local target_basename
+
+    # --update-build may replace generated Chromium source, but only at this
+    # exact path. Authored Chromium Conductor changes belong in patches.local/,
+    # not as hand edits inside build/src.
+    [[ -n "${target}" ]] || error "Stopping before source reset: target path is empty."
+    [[ "${target}" = /* ]] || error "Stopping before source reset: target path is not absolute: ${target}"
+    [[ "${target}" != "/" ]] || error "Stopping before source reset: target path is /."
+    [[ "${target}" != "${SCRIPT_DIR}" ]] || error "Stopping before source reset: target path is SCRIPT_DIR: ${target}"
+    [[ "${target}" != "${REPO_DIR}" ]] || error "Stopping before source reset: target path is REPO_DIR: ${target}"
+    [[ "${target}" != "${BUILD_DIR}" ]] || error "Stopping before source reset: target path is BUILD_DIR: ${target}"
+    [[ "${target}" == "${expected}" ]] || error "Stopping before source reset: expected ${expected}, got ${target}"
+
+    target_basename="$(basename "${target}")"
+    [[ "${target_basename}" == "src" ]] || error "Stopping before source reset: unexpected basename ${target_basename}"
+}
+
+ensure_git_tree_clean() {
+    local repo_path="${1}"
+    local label="${2}"
+    local status_output
+
+    is_git_worktree "${repo_path}" || error "Expected ${label} to be a git worktree: ${repo_path}"
+
+    status_output="$(git -C "${repo_path}" status --porcelain --untracked-files=all)"
+    if [[ -n "${status_output}" ]]; then
+        warn "${label} has local changes:"
+        printf '%s\n' "${status_output}" >&2
+        error "Stopping before update-build changes ${label}. Inspect or preserve those changes, then rerun."
+    fi
+
+    success "${label} is clean"
+}
+
+validate_existing_update_checkout() {
+    section "checking generated checkout"
+    explain "confirm update-build has an existing checkout to reuse"
+
+    if [[ ! -d "${REPO_DIR}" ]] || [[ ! -d "${MAIN_REPO}" ]] || [[ ! -d "${SRC_DIR}" ]]; then
+        error "No existing checkout found. Run ./forge.sh for a full clean rebuild first."
+    fi
+
+    require_executable "${RETRIEVE_SCRIPT}"
+    is_git_worktree "${REPO_DIR}" || error "Expected a git checkout at ${REPO_DIR}"
+    is_git_worktree "${MAIN_REPO}" || error "Expected a git checkout at ${MAIN_REPO}"
+    require_file "${SRC_DIR}/DEPS"
+
+    info "Generated checkout: ${REPO_DIR}"
+    info "Ungoogled Chromium files: ${MAIN_REPO}"
+    info "Generated Chromium source: ${SRC_DIR}"
+    success "Generated checkout is present"
+}
+
+check_update_dirty_state() {
+    section "checking for local changes"
+    explain "stop before update-build if Git-tracked files need attention"
+
+    ensure_git_tree_clean "${REPO_DIR}" "generated checkout"
+    ensure_git_tree_clean "${MAIN_REPO}" "ungoogled Chromium files"
+
+    if [[ -d "${SRC_DIR}" ]]; then
+        info "Generated Chromium source is archive-unpacked, not its own Git checkout."
+        info "update-build will refresh ${SRC_DIR} from the clean source archive before patching."
+        info "Build cache at ${SRC_DIR}/out will be kept when possible."
+    fi
 }
 
 load_config() {
@@ -475,18 +745,11 @@ load_config() {
 }
 
 validate_local_version_consistency() {
-    section "validating local version consistency"
-    explain "stop before any wipe or build if the fork's declared version and the local checkout disagree"
+    section "checking local version files"
+    explain "stop before deleting or building if the version files disagree"
 
-    # Three places state a Chromium version for this workspace:
-    #   - forge.conf VERSION       (this fork's declared build target)
-    #   - version.txt              (the version marker file beside the script)
-    #   - ungoogled-chromium/chromium_version.txt (the version present on disk)
-    # The first two should always agree; if they do not, the workspace is
-    # internally inconsistent. If the local checkout exists and disagrees with
-    # the declared version, the workspace is out of sync with what the script
-    # is about to build. Catching either case here keeps the wipe-and-rebuild
-    # honest before any destructive or expensive work begins.
+    # forge.conf and version.txt should agree. If generated Chromium files are
+    # present, their Chromium version should agree too.
     local conf_version="${VERSION:-}"
     local marker_version=""
     local checkout_version=""
@@ -513,10 +776,10 @@ validate_local_version_consistency() {
 
     if [[ -f "${checkout_version_file}" ]]; then
         checkout_version="$(tr -d '[:space:]' < "${checkout_version_file}")"
-        info "Detected (local checkout):     ${checkout_version}"
+        info "Detected (generated checkout): ${checkout_version}"
 
         if [[ -n "${checkout_version}" && "${checkout_version}" != "${conf_version}" ]]; then
-            error "local checkout version does not match this fork's declared version.
+            error "local checkout version does not match Chromium Conductor's declared version.
   expected: ${conf_version}
     from ${CONF_FILE} and ${VERSION_FILE}
   detected: ${checkout_version}
@@ -531,19 +794,14 @@ validate_local_version_consistency() {
 }
 
 check_for_update() {
-    section "checking upstream for a newer release"
-    explain "compare the latest published ungoogled-chromium-macos release against the last verified local build"
+    section "checking upstream release"
+    explain "read-only check: ask GitHub for latest release and compare it with the last successful build"
 
-    # Remote: the same source the full build uses — the latest release tag from
-    # the ungoogled-chromium-macos GitHub releases API. Pulled here via the
-    # existing minimal helper (one curl + python tag_name extraction).
-    #
-    # Local: .forge-last-built-version, written at the end of a successful build.
-    # That marker is the only file that proves verify_outputs passed; version.txt
-    # only records what the most recent run intended to build, not what shipped.
-    # If the marker does not exist yet (first --check on a fresh workspace, or
-    # the last build predates this feature), fall back to version.txt with a
-    # plain note that the comparison is at Chromium-version precision only.
+    # Remote means the latest upstream ungoogled-chromium-macos release.
+    # Local means .forge-last-built-version when it exists, because that file is
+    # written only after a successful build. If there is no build marker yet,
+    # fall back to version.txt; that can compare Chromium versions, but not
+    # wrapper-only release suffixes like -1.1 vs -1.2.
     fetch_latest_release_metadata
 
     local local_tag=""
@@ -568,18 +826,17 @@ check_for_update() {
     fi
 
     info ""
-    info "Latest remote tag:     ${LATEST_TAG}"
-    info "Latest remote version: ${LATEST_VERSION}"
+    info "Upstream tag:        ${LATEST_TAG}"
+    info "Upstream Chromium:   ${LATEST_VERSION}"
     if [[ -n "${local_tag}" ]]; then
-        info "Last built tag:        ${local_tag}"
+        info "Last built tag:     ${local_tag}"
     fi
-    info "Last built version:    ${local_version:-<unknown>}"
-    info "Local source:          ${local_source:-<none>}"
+    info "Local Chromium:      ${local_version:-}"
+    info "Compared from:       ${local_source:-}"
     if (( fallback_used )); then
-        info "Note: no ${LAST_BUILT_VERSION_FILE} yet; falling back to version.txt."
-        info "      Comparison is at Chromium-version precision; wrapper revisions"
-        info "      (e.g., -1.1 vs -1.2) cannot be distinguished until the next"
-        info "      successful ./forge.sh writes the marker."
+        info "Note: no ${LAST_BUILT_VERSION_FILE} yet, so version.txt is being used."
+        info "      This catches Chromium version changes, but not wrapper-only revisions."
+        info "      The next successful build will write the precise marker."
     fi
     info ""
 
@@ -588,14 +845,13 @@ check_for_update() {
         return
     fi
 
-    # Prefer tag-precise comparison when both sides have a tag. Otherwise the
-    # marker is missing and we fall back to Chromium-version comparison from
-    # version.txt, which is coarser but still useful.
+    # Prefer an exact release-tag comparison. If there is no built-tag marker
+    # yet, use the Chromium version from version.txt as the best available clue.
     if [[ -n "${local_tag}" ]]; then
         if [[ "${local_tag}" == "${LATEST_TAG}" ]]; then
-            success "Status: current. Local build matches latest release ${LATEST_TAG}."
+            success "Status: current: ${LATEST_TAG}"
         else
-            info "Status: update available. Upstream ${LATEST_TAG} differs from local ${local_tag}."
+            info "Status: update available: upstream ${LATEST_TAG}, local ${local_tag}"
             info "Run ./forge.sh to rebuild against the latest release."
         fi
     else
@@ -609,14 +865,24 @@ check_for_update() {
 }
 
 print_run_config() {
-    section "configuration"
-    explain "show the local build choices before network and build work begins"
+    section "build choices"
+    explain "show the local choices before network or build work starts"
     info "Ninja jobs: ${JOBS}"
-    info "Repo refresh: clear and re-clone every run"
-    info "Repo URL: ${REPO_URL}"
+    case "${MODE}" in
+        full)
+            info "Checkout: delete the generated checkout and start fresh"
+            ;;
+        update-build)
+            info "Checkout: reuse what is safe, refresh generated source, keep out cache if possible"
+            ;;
+        *)
+            info "Checkout: none"
+            ;;
+    esac
+    info "Upstream repo: ${REPO_URL}"
     info "Target architecture: ${ARCH_GN}"
     info "Download cache: ${DOWNLOAD_CACHE}"
-    info "Source directory: ${SRC_DIR}"
+    info "Generated source: ${SRC_DIR}"
 }
 
 extract_chromium_version_from_tag() {
@@ -631,12 +897,12 @@ extract_chromium_version_from_tag() {
 }
 
 fetch_latest_release_metadata() {
-    section "discovering latest release"
-    explain "ask GitHub which ungoogled-chromium-macos release should be rebuilt"
+    section "checking upstream release"
+    explain "ask GitHub which upstream release to use"
 
-    # GitHub release metadata is the source of truth for "latest." The local
-    # version files are updated from this value so the wrapper and upstream
-    # checkout agree on the Chromium version before build inputs are restored.
+    # GitHub release metadata is the source of truth for "latest." Build modes
+    # use this release to sync version files, checkout state, source archives,
+    # and patches.
     info "Fetching the latest ungoogled-chromium-macos release..."
 
     LATEST_TAG="$(
@@ -655,10 +921,10 @@ fetch_latest_release_metadata() {
 
 ensure_release_tag_exists() {
     section "fetching release tags"
-    explain "make the discovered release tag available in the fresh clone before checkout"
+    explain "make the release tag available before checkout"
 
-    # A fresh clone may not have every tag locally. Fetch tags explicitly, then
-    # require the release tag we discovered from GitHub to exist before checkout.
+    # A clone may not have every tag locally. Fetch tags explicitly, then require
+    # the release tag we discovered from GitHub to exist before checkout.
     info "Fetching repo tags..."
     git -C "${REPO_DIR}" fetch --tags --prune
 
@@ -669,12 +935,11 @@ ensure_release_tag_exists() {
 }
 
 update_version_markers() {
-    section "updating local version markers"
-    explain "record the Chromium version beside the script so the workspace documents this run"
+    section "updating local version files"
+    explain "record the Chromium version this run is building"
 
-    # Keep the local wrapper metadata synchronized with the release being built.
-    # These authored files live beside the script, so updating them keeps the
-    # workspace recipe in sync with the release this run targets.
+    # forge.conf and version.txt are authored project files. Keep them in sync
+    # with the upstream release this run is about to build.
     if grep -q '^VERSION=' "${CONF_FILE}"; then
         sed -i.bak "s/^VERSION=.*/VERSION=\"${LATEST_VERSION}\"/" "${CONF_FILE}"
         rm -f "${CONF_FILE}.bak"
@@ -692,8 +957,8 @@ update_version_markers() {
 }
 
 align_repo_to_latest_release() {
-    section "pinning fresh checkout"
-    explain "detach the checkout at the published release tag and sync its submodule to the matching patch set"
+    section "pinning upstream checkout"
+    explain "check out the published release and sync the matching ungoogled files"
 
     # Always build the published release tag, detached. Branch state is not part
     # of this workflow; the script is a release rebuilder, not a local branch
@@ -709,8 +974,8 @@ align_repo_to_latest_release() {
 }
 
 validate_post_checkout_layout() {
-    section "validating pinned checkout"
-    explain "stop early if the pinned release does not contain the files required for patching and flag generation"
+    section "checking release files"
+    explain "stop early if the pinned release is missing files needed for patches or flags"
 
     # These files are the contract between the macOS wrapper and the shared
     # ungoogled-chromium repo. If any are absent after checkout/submodule init,
@@ -740,38 +1005,37 @@ validate_post_checkout_layout() {
 }
 
 delete_build_state() {
-    section "clearing generated state"
-    explain "remove generated build output so earlier files cannot shape the next run"
+    section "clearing generated build state"
+    explain "remove generated build files from earlier runs"
 
-    # The repo itself was freshly cloned, but build/ is still treated as
-    # generated state and explicitly removed after checkout alignment. This
-    # keeps the build phase independent of partial retrievals, interrupted runs,
-    # or generated files that appeared after the clone.
-    info "Clearing ${BUILD_DIR}"
+    # build/ is generated state. Clear it during full rebuild so partial
+    # downloads, interrupted runs, or stale build files cannot steer the next run.
+    info "Clearing generated build state: ${BUILD_DIR}"
 
     if [[ -d "${BUILD_DIR}" ]]; then
         guard_build_delete_target
+        # build/ holds out/Default/Chromium.app; do not pull it out from under
+        # a running browser.
+        assert_no_running_build_output "clear generated build state"
 
-        local attempt
+        # macOS Finder can recreate .DS_Store mid-delete and the external volume
+        # can briefly hold directory entries, so a single rm may hit a transient
+        # "Directory not empty". We retry a few times, sweeping .DS_Store between
+        # attempts. We do NOT silence the outcome: the existence check after the
+        # loop is the authoritative gate and stops loudly if anything remains.
+        local attempt rm_status
         for attempt in 1 2 3; do
-            if rm -rf "${BUILD_DIR}" 2>/dev/null; then
-                break
-            fi
+            rm_status=0
+            rm -rf "${BUILD_DIR}" || rm_status=$?
+            [[ -e "${BUILD_DIR}" ]] || break
 
-            warn "Build directory cleanup needed another pass on attempt ${attempt}; retrying."
-
-            if [[ -d "${BUILD_DIR}" ]]; then
-                find "${BUILD_DIR}" -name ".DS_Store" -delete 2>/dev/null || true
-                find "${BUILD_DIR}" -depth -type d -empty -delete 2>/dev/null || true
-            fi
-
+            warn "Build directory cleanup needed another pass on attempt ${attempt} (rm exit ${rm_status}); retrying."
+            # Best-effort .DS_Store sweep so the next rm can finish. If the sweep
+            # itself fails, say so rather than hiding it; the real gate is below.
+            find "${BUILD_DIR}" -name ".DS_Store" -delete \
+                || warn "Could not sweep all .DS_Store files under ${BUILD_DIR}"
             sleep 1
         done
-
-        if [[ -e "${BUILD_DIR}" ]]; then
-            find "${BUILD_DIR}" -name ".DS_Store" -delete 2>/dev/null || true
-            find "${BUILD_DIR}" -depth -type d -empty -delete 2>/dev/null || true
-        fi
     fi
 
     if [[ -e "${BUILD_DIR}" ]]; then
@@ -780,18 +1044,20 @@ delete_build_state() {
         error "Could not fully clear ${BUILD_DIR}. Close any Finder windows or other processes touching that tree and run ./forge.sh again."
     fi
 
-    # Python helper scripts are used heavily during resource retrieval and patch
-    # application. Bytecode caches are generated crumbs, so remove them before
-    # continuing to keep the refreshed checkout easy to inspect.
-    find "${REPO_DIR}" -name "*.pyc" -delete 2>/dev/null || true
-    find "${REPO_DIR}" -name "__pycache__" -type d -prune -exec rm -rf {} + 2>/dev/null || true
+    # Python bytecode caches are generated; remove them so a stale .pyc can never
+    # shadow a helper script. A sweep failure is surfaced as a warning, not
+    # silently dropped.
+    find "${REPO_DIR}" -name "*.pyc" -delete \
+        || warn "Could not remove all .pyc files under ${REPO_DIR}"
+    find "${REPO_DIR}" -name "__pycache__" -type d -prune -exec rm -rf {} + \
+        || warn "Could not remove all __pycache__ directories under ${REPO_DIR}"
 
-    success "Generated workflow state cleared"
+    success "Generated build state cleared"
 }
 
 retrieve_sources_and_resources() {
-    section "restoring source archive and shared resources"
-    explain "download the known Chromium source archive instead of using the heavier gclient clone path"
+    section "restoring Chromium source"
+    explain "download the known Chromium source archive instead of using the heavier gclient path"
 
     # Use the upstream helper's download mode (-d). Without -d, the helper takes
     # the git/gclient clone path, which has many more moving pieces for this
@@ -804,7 +1070,7 @@ retrieve_sources_and_resources() {
 
     cd "${REPO_DIR}"
 
-    info "Retrieving Chromium source archive and shared resources for ${ARCH_GN}"
+    info "Retrieving Chromium source archive for ${ARCH_GN}"
     "${RETRIEVE_SCRIPT}" -d -g "${ARCH_RESOURCE}"
 
     require_dir "${SRC_DIR}"
@@ -814,7 +1080,63 @@ retrieve_sources_and_resources() {
     require_dir "${SRC_DIR}/build"
     require_dir "${SRC_DIR}/chrome"
 
-    success "Sources and generic resources are ready"
+    success "Chromium source is ready"
+}
+
+mark_source_state() {
+    mkdir -p "${BUILD_DIR}"
+    {
+        printf 'mode=%s\n' "${MODE}"
+        printf 'release_tag=%s\n' "${LATEST_TAG:-<unknown>}"
+        printf 'chromium_version=%s\n' "${LATEST_VERSION:-<unknown>}"
+        printf 'source_dir=%s\n' "${SRC_DIR}"
+        printf 'updated_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "${SOURCE_STATE_FILE}"
+    info "Recorded generated source state in ${SOURCE_STATE_FILE}"
+}
+
+reset_generated_source_for_update() {
+    section "refreshing generated source"
+    explain "replace build/src before patching, while keeping build output cache when possible"
+
+    require_dir "${BUILD_DIR}"
+    require_dir "${SRC_DIR}"
+    guard_src_delete_target
+    # The source tree carries out/Default; refuse to replace it while a browser
+    # built from it is still running.
+    assert_no_running_build_output "refresh the generated source tree"
+
+    if [[ -e "${UPDATE_BUILD_STASH_DIR}" ]]; then
+        error "Stale update-build stash exists at ${UPDATE_BUILD_STASH_DIR}. Inspect it before rerunning update-build."
+    fi
+
+    local preserved_out=0
+    if [[ -d "${SRC_DIR}/out" ]]; then
+        mkdir -p "${UPDATE_BUILD_STASH_DIR}"
+        info "Keeping build output cache: ${SRC_DIR}/out"
+        mv "${SRC_DIR}/out" "${UPDATE_OUT_STASH}"
+        preserved_out=1
+    else
+        info "No build output cache to keep at ${SRC_DIR}/out"
+    fi
+
+    info "Refreshing generated source tree: ${SRC_DIR}"
+    rm -rf "${SRC_DIR}"
+    mkdir -p "${SRC_DIR}"
+
+    retrieve_sources_and_resources
+
+    if (( preserved_out )); then
+        [[ ! -e "${SRC_DIR}/out" ]] || error "Cannot restore preserved out cache because ${SRC_DIR}/out already exists."
+        info "Restoring build output cache: ${SRC_DIR}/out"
+        mv "${UPDATE_OUT_STASH}" "${SRC_DIR}/out"
+        # The stash dir should be empty now. If it is not, something unexpected
+        # was left behind, so surface it instead of silently ignoring it.
+        rmdir "${UPDATE_BUILD_STASH_DIR}" \
+            || warn "Update-build stash dir not empty after restoring out cache: ${UPDATE_BUILD_STASH_DIR}"
+    fi
+
+    success "Generated source refreshed from clean archive"
 }
 
 series_has_entries() {
@@ -827,16 +1149,14 @@ print_local_patch_notes() {
     local patch_path manifest_line _manifest_patch summary reason
 
     if ! series_has_entries "${LOCAL_PATCHES_SERIES}"; then
-        info "No local custom patches listed yet; the local patch layer is ready when you are"
+        info "No patches.local entries yet"
         return
     fi
 
-    info "Local custom patch notes come from ${LOCAL_PATCHES_MANIFEST}"
+    info "patches.local notes: ${LOCAL_PATCHES_MANIFEST}"
 
-    # Each non-comment entry in patches.local/series is a patch that will be
-    # applied after upstream and macOS patches. The optional inline comments in
-    # series are for quick scanning; manifest.tsv is the longer explanation that
-    # the CLI prints here.
+    # patches.local/series is the local patch order. Inline comments are the
+    # quick labels; manifest.tsv is the longer note printed here.
     while IFS= read -r patch_path; do
         info "Local patch: ${patch_path}"
 
@@ -854,7 +1174,7 @@ print_local_patch_notes() {
         )"
 
         if [[ -z "${manifest_line}" ]]; then
-            info "  why: no manifest note yet; add one so this patch can explain itself later"
+            info "  why: no manifest note yet"
             continue
         fi
 
@@ -869,9 +1189,9 @@ print_local_patch_notes() {
 }
 
 apply_local_custom_patches() {
-    # Local patches live beside this script and are intentionally applied last.
-    # That makes them the workspace preference layer on top of upstream
-    # ungoogled-chromium and macOS-specific compatibility patches.
+    # patches.local/ is applied last on purpose. This is where Chromium Conductor
+    # actually lives: Core Audio routing, tab menu work, and everything we've
+    # added on top of ungoogled-chromium-macos.
     print_local_patch_notes
 
     if ! series_has_entries "${LOCAL_PATCHES_SERIES}"; then
@@ -881,25 +1201,42 @@ apply_local_custom_patches() {
     python3 "${MAIN_REPO}/utils/patches.py" apply "${SRC_DIR}" "${LOCAL_PATCHES_DIR}"
 }
 
-apply_source_customizations() {
-    section "applying source customizations"
-    explain "turn upstream Chromium source into the ungoogled macOS source tree we actually want to build"
+assert_source_fully_patched() {
+    # A clean patch run leaves no .rej files. Some patch tools exit 0 even when a
+    # hunk is rejected (writing a .rej alongside the target), so verify this
+    # explicitly rather than trusting exit status alone. A half-patched tree must
+    # never reach the build: it would compile the wrong thing, or fail much later
+    # in Ninja with a far more confusing error than this one.
+    local rej_files rej_count
+    rej_files="$(find "${SRC_DIR}" -type f -name '*.rej')"
+    rej_count="$(printf '%s' "${rej_files}" | grep -c . || true)"
 
-    # The upstream source archive is not the browser we want yet. This phase
-    # turns raw Chromium into ungoogled-chromium for macOS by pruning unwanted
-    # binaries, applying the shared patch stack, applying macOS-specific patches,
-    # applying the local preference layer, and replacing configured Google
-    # domains.
+    if [[ "${rej_count}" != "0" ]]; then
+        warn "Found ${rej_count} rejected patch hunk file(s) under ${SRC_DIR}:"
+        printf '%s\n' "${rej_files}" | sed 's/^/[forge]   rej: /' >&2
+        error "Source is half-patched. Refusing to build. Refresh the failing patch(es), then rerun."
+    fi
+
+    info "No rejected patch hunks: the patch set applied cleanly"
+}
+
+apply_source_customizations() {
+    section "preparing Chromium source"
+    explain "apply ungoogled, macOS, and local patches before the build starts"
+
+    # The source archive is raw Chromium. Prepare it in layers:
+    # upstream ungoogled patches, macOS patches, patches.local/, then domain
+    # substitution.
     info "Pruning binaries..."
     python3 "${MAIN_REPO}/utils/prune_binaries.py" "${SRC_DIR}" "${MAIN_REPO}/pruning.list"
 
-    info "Applying upstream ungoogled-chromium patch stack..."
+    info "Applying upstream ungoogled patches..."
     python3 "${MAIN_REPO}/utils/patches.py" apply "${SRC_DIR}" "${MAIN_REPO}/patches"
 
-    info "Applying macOS patch stack..."
+    info "Applying macOS patches..."
     python3 "${MAIN_REPO}/utils/patches.py" apply "${SRC_DIR}" "${REPO_DIR}/patches"
 
-    info "Applying local custom patch layer..."
+    info "Applying patches.local..."
     apply_local_custom_patches
 
     info "Applying domain substitution..."
@@ -908,12 +1245,15 @@ apply_source_customizations() {
         -f "${MAIN_REPO}/domain_substitution.list" \
         "${SRC_DIR}"
 
-    success "Source customizations applied"
+    # Completeness gate: never carry a half-patched tree into the build.
+    assert_source_fully_patched
+
+    success "Patches and cleanup applied"
 }
 
 write_args_gn() {
-    section "generating args.gn"
-    explain "combine upstream flags with local macOS flags, then force the configured target CPU"
+    section "writing args.gn"
+    explain "combine upstream flags with local macOS flags, then set the target CPU"
 
     # args.gn is generated, not hand-edited. Start from upstream flags, layer the
     # local macOS flags, and then write target_cpu last so the configured ARCH in
@@ -935,8 +1275,8 @@ write_args_gn() {
 }
 
 retrieve_platform_resources() {
-    section "restoring platform resources"
-    explain "restore the macOS toolchain pieces GN and Ninja need before compilation starts"
+    section "restoring macOS build tools"
+    explain "restore LLVM, Rust, and Node pieces before GN and Ninja inspect the tree"
 
     # Toolchains are large, generated dependencies. Restore them after patching
     # and args generation so the source tree has the expected macOS LLVM, Rust,
@@ -953,12 +1293,12 @@ retrieve_platform_resources() {
     require_executable "${SRC_DIR}/third_party/rust-toolchain/bin/cargo"
     require_executable "${SRC_DIR}/third_party/rust-toolchain/bin/rustc"
 
-    success "Platform-specific resources are ready"
+    success "macOS build tools are ready"
 }
 
 build_from_scratch() {
-    section "rebuilding"
-    explain "bootstrap the build tools, generate the build graph, then let Ninja compile and link"
+    section "running GN and Ninja"
+    explain "bootstrap build tools, generate the build graph, then compile Chromium.app"
 
     # Chromium's build has several generated layers. Bootstrap GN first, build
     # bindgen for Rust/C++ interop, ask GN to materialize the Ninja build graph,
@@ -992,12 +1332,12 @@ build_from_scratch() {
         info "Skipping code signing (MACOS_CERTIFICATE_NAME not set)"
     fi
 
-    success "Build completed"
+    success "Build finished"
 }
 
 verify_outputs() {
-    section "verifying"
-    explain "check that the build produced the app bundle and chromedriver promised by this workflow"
+    section "checking build output"
+    explain "make sure Chromium.app and chromedriver were produced"
 
     # Treat expected artifacts as part of the contract. Ninja can fail loudly,
     # but an explicit artifact check gives the final log a clear "yes, the
@@ -1005,7 +1345,7 @@ verify_outputs() {
     require_dir "${SRC_DIR}/out/Default/Chromium.app"
     require_executable "${SRC_DIR}/out/Default/chromedriver"
 
-    success "Verified Chromium.app and chromedriver"
+    success "Chromium.app and chromedriver are present"
 }
 
 record_built_version() {
@@ -1023,56 +1363,222 @@ record_built_version() {
     info "Recorded built release in ${LAST_BUILT_VERSION_FILE}: ${LATEST_TAG}"
 }
 
+verify_source_and_build_state() {
+    section "verifying source and build state"
+    explain "read-only report: no checkout changes, no patching, no building"
+
+    # A running count of problems. Anything that would make a build unsafe or
+    # impossible bumps it; the summary and the exit status reflect the total.
+    local issues=0
+
+    # 1. Is a browser from this tree running right now? A full or update-build
+    #    run would refuse to delete the tree while this is true.
+    local running_pids
+    running_pids="$(running_build_output_pids)"
+    if [[ -n "${running_pids}" ]]; then
+        warn "A Chromium built from this tree appears to be running:"
+        local pid
+        while IFS= read -r pid; do
+            [[ -n "${pid}" ]] || continue
+            ps -o pid=,comm= -p "${pid}" 2>/dev/null | sed 's/^/[forge]   /' || true
+        done <<< "${running_pids}"
+        warn "Quit it before a full or update-build run, or those runs will stop."
+        issues=$((issues + 1))
+    else
+        info "Running browser from tree: none (${SRC_DIR}/out/Default)"
+    fi
+
+    # 2. Generated wrapper checkout.
+    if [[ -d "${REPO_DIR}" ]]; then
+        info "Generated checkout: present (${REPO_DIR})"
+        if is_git_worktree "${REPO_DIR}"; then
+            info "  git worktree: yes"
+        else
+            warn "  git worktree: no (checkout looks incomplete)"
+            issues=$((issues + 1))
+        fi
+    else
+        info "Generated checkout: absent (a full rebuild would clone it fresh)"
+    fi
+
+    # 3. Generated Chromium source: presence plus a shallow completeness probe.
+    if [[ -d "${SRC_DIR}" ]]; then
+        info "Generated source: present (${SRC_DIR})"
+        local required_path
+        for required_path in \
+            "${SRC_DIR}/DEPS" \
+            "${SRC_DIR}/tools/gn/bootstrap/bootstrap.py" \
+            "${SRC_DIR}/build" \
+            "${SRC_DIR}/chrome"; do
+            if [[ -e "${required_path}" ]]; then
+                info "  present: ${required_path}"
+            else
+                warn "  missing: ${required_path}"
+                issues=$((issues + 1))
+            fi
+        done
+
+        # Leftover .rej files mean a patch did not apply cleanly. A half-patched
+        # tree must not be trusted for a build.
+        local rej_files rej_count
+        rej_files="$(find "${SRC_DIR}" -type f -name '*.rej' 2>/dev/null)"
+        rej_count="$(printf '%s' "${rej_files}" | grep -c . || true)"
+        if [[ "${rej_count}" != "0" ]]; then
+            warn "  half-patched: ${rej_count} leftover .rej file(s) found"
+            printf '%s\n' "${rej_files}" | sed 's/^/[forge]   rej: /'
+            issues=$((issues + 1))
+        else
+            info "  no failed-patch (.rej) files"
+        fi
+    else
+        info "Generated source: absent (${SRC_DIR})"
+    fi
+
+    # 4. Source-state marker, written only after a clean source prep.
+    if [[ -f "${SOURCE_STATE_FILE}" ]]; then
+        info "Source-state marker: ${SOURCE_STATE_FILE}"
+        sed 's/^/[forge]   /' < "${SOURCE_STATE_FILE}"
+    else
+        info "Source-state marker: absent (last source prep did not finish, or no run yet)"
+    fi
+
+    # 5. Build output.
+    if [[ -d "${SRC_DIR}/out/Default/Chromium.app" ]]; then
+        info "Build output: Chromium.app present"
+    else
+        info "Build output: Chromium.app absent (no completed build)"
+    fi
+    if [[ -x "${SRC_DIR}/out/Default/chromedriver" ]]; then
+        info "Build output: chromedriver present"
+    else
+        info "Build output: chromedriver absent"
+    fi
+
+    # 6. Last successfully built release.
+    if [[ -s "${LAST_BUILT_VERSION_FILE}" ]]; then
+        info "Last built release: $(tr -d '[:space:]' < "${LAST_BUILT_VERSION_FILE}")"
+    else
+        info "Last built release: none recorded yet"
+    fi
+
+    section "verify summary"
+    if (( issues == 0 )); then
+        success "No problems detected in source/build state."
+        return 0
+    fi
+    warn "${issues} issue(s) detected (see messages above)."
+    return 1
+}
+
 main() {
     parse_args "$@"
     log_init
     print_shell_telemetry
+    print_mode
 
-    section "clean"
+    section "preflight"
     validate_host_layout
     load_config
     validate_local_version_consistency
 
-    # --check is a read-only preflight + upstream version probe: validate the
-    # workbench, confirm local version files agree, then hit the GitHub releases
-    # API to compare the latest published tag against the last verified local
-    # build. No refresh, no checkout work, no build.
-    if [[ "${CHECK_ONLY}" == "1" ]]; then
-        check_for_update
-        section "done"
-        success "Forge check complete."
-        exit 0
-    fi
+    case "${MODE}" in
+        check)
+            # --check is read-only:
+            # validate local files, ask GitHub for the latest published release,
+            # compare it with the last successful local build, then stop.
+            # No checkout refresh, no patching, no build.
+            check_for_update
+            section "done"
+            success "Forge check complete."
+            ;;
+        verify-only)
+            # --verify-only is read-only:
+            # report the running-app, checkout, source, and build-output state,
+            # then stop. No checkout refresh, no patching, no build.
+            local verify_rc=0
+            verify_source_and_build_state || verify_rc=$?
+            section "done"
+            if (( verify_rc == 0 )); then
+                success "Verify-only complete: no problems detected."
+            else
+                warn "Verify-only complete: issues detected (see messages above)."
+                exit 1
+            fi
+            ;;
+        clean)
+            # --clean is destructive but guarded: it removes only the generated
+            # checkout forge.sh owns, after the running-browser guard and an
+            # explicit confirmation. Logs and authored files are preserved.
+            clean_generated_state
+            section "done"
+            success "Forge clean complete."
+            ;;
+        full)
+            print_run_config
 
-    print_run_config
+            section "refreshing generated checkout"
+            info "Deleting the generated checkout and starting fresh from upstream: ${REPO_DIR}"
+            safe_remove_repo_dir
+            clone_fresh_repo
 
-    section "refreshing repo checkout"
-    info "Refreshing ${REPO_DIR} from upstream"
-    safe_remove_repo_dir
-    clone_fresh_repo
+            section "restoring source and patches"
+            validate_repo_layout
+            fetch_latest_release_metadata
+            ensure_release_tag_exists
+            update_version_markers
+            align_repo_to_latest_release
+            validate_post_checkout_layout
+            delete_build_state
+            retrieve_sources_and_resources
+            apply_source_customizations
+            mark_source_state
 
-    section "restore dependencies"
-    validate_repo_layout
-    fetch_latest_release_metadata
-    ensure_release_tag_exists
-    update_version_markers
-    align_repo_to_latest_release
-    validate_post_checkout_layout
-    delete_build_state
-    retrieve_sources_and_resources
-    apply_source_customizations
+            section "generating build files"
+            write_args_gn
+            retrieve_platform_resources
 
-    section "generate"
-    write_args_gn
-    retrieve_platform_resources
+            section "building Chromium.app"
+            build_from_scratch
+            verify_outputs
+            record_built_version
 
-    section "build"
-    build_from_scratch
-    verify_outputs
-    record_built_version
+            section "done"
+            success "Full rebuild complete: ${LATEST_TAG}"
+            ;;
+        update-build)
+            print_run_config
+            validate_existing_update_checkout
+            check_update_dirty_state
 
-    section "done"
-    success "Full rebuild complete for ${LATEST_TAG}"
+            section "checking upstream release"
+            explain "find the upstream release for this update-build"
+            fetch_latest_release_metadata
+            ensure_release_tag_exists
+            update_version_markers
+            align_repo_to_latest_release
+            validate_post_checkout_layout
+
+            reset_generated_source_for_update
+
+            apply_source_customizations
+            mark_source_state
+
+            section "generating build files"
+            write_args_gn
+            retrieve_platform_resources
+
+            section "building Chromium.app"
+            build_from_scratch
+            verify_outputs
+            record_built_version
+
+            section "done"
+            success "Update-build complete: ${LATEST_TAG}"
+            ;;
+        *)
+            error "Internal error: unknown mode '${MODE}'"
+            ;;
+    esac
 }
 
 main "$@"
