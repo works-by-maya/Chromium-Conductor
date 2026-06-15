@@ -963,17 +963,41 @@ fetch_latest_release_metadata() {
     section "checking upstream release"
     explain "ask GitHub which upstream release to use"
 
-    # GitHub release metadata is the source of truth for "latest." Build modes
-    # use this release to sync version files, checkout state, source archives,
-    # and patches.
+    # GitHub release metadata is consulted only when no explicit local version is
+    # declared (see select_release_tag). Validate the transfer and the JSON
+    # before parsing, so a transient outage (e.g. HTTP 504) becomes a clear
+    # message instead of a Python traceback on empty input.
     info "Fetching the latest ungoogled-chromium-macos release..."
 
-    LATEST_TAG="$(
-        curl -fsSL "${UNGOOGLED_RELEASES_API}" | \
-        python3 -c "import json, sys; print(json.load(sys.stdin).get('tag_name', ''))"
-    )"
+    local response
+    if ! response="$(curl -fsSL "${UNGOOGLED_RELEASES_API}")"; then
+        error "Could not reach GitHub to discover the latest release (curl failed):
+  ${UNGOOGLED_RELEASES_API}
+  This is often a transient GitHub outage (e.g. HTTP 5xx). Retry later, or set
+  VERSION in ${CONF_FILE} (and ${VERSION_FILE}) to build a specific release
+  without GitHub discovery."
+    fi
 
-    [[ -n "${LATEST_TAG}" ]] || error "Failed to read the latest release tag from ${UNGOOGLED_RELEASES_API}"
+    [[ -n "${response}" ]] || error "GitHub returned an empty latest-release response:
+  ${UNGOOGLED_RELEASES_API}
+  Retry later, or set VERSION in ${CONF_FILE} to build a specific release."
+
+    # Parse in a separate step from the transfer. Any non-JSON / unexpected shape
+    # exits 2 (no traceback), which the || error below turns into a clean stop.
+    LATEST_TAG="$(
+        printf '%s' "${response}" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+print(data.get("tag_name", "") if isinstance(data, dict) else "")
+' 2>/dev/null
+    )" || error "GitHub returned a response that was not valid JSON:
+  ${UNGOOGLED_RELEASES_API}
+  Retry later, or set VERSION in ${CONF_FILE} to build a specific release."
+
+    [[ -n "${LATEST_TAG}" ]] || error "GitHub's latest-release response contained no tag_name."
 
     LATEST_VERSION="$(extract_chromium_version_from_tag "${LATEST_TAG}")"
     [[ -n "${LATEST_VERSION}" ]] || error "Failed to extract a Chromium version from release tag '${LATEST_TAG}'"
@@ -982,19 +1006,72 @@ fetch_latest_release_metadata() {
     info "Chromium version: ${LATEST_VERSION}"
 }
 
-ensure_release_tag_exists() {
-    section "fetching release tags"
-    explain "make the release tag available before checkout"
+select_release_tag() {
+    section "selecting release tag"
+    explain "prefer the version declared locally; ask GitHub only when none is set"
 
-    # A clone may not have every tag locally. Fetch tags explicitly, then require
-    # the release tag we discovered from GitHub to exist before checkout.
+    # Make every upstream tag available locally first. This uses the git protocol
+    # (the same path the clone just used), so it keeps working even when GitHub's
+    # REST API is unavailable (e.g. the HTTP 504 that broke an earlier run). A
+    # clone may not carry every tag, so fetch them explicitly.
     info "Fetching repo tags..."
     git -C "${REPO_DIR}" fetch --tags --prune
 
-    git -C "${REPO_DIR}" rev-parse -q --verify "refs/tags/${LATEST_TAG}" >/dev/null || \
-        error "Release tag '${LATEST_TAG}' was not found in ${REPO_DIR} after fetching tags."
+    # Prefer an explicit local version. forge.conf VERSION is the primary source;
+    # version.txt is the fallback. Only when neither is set do we ask GitHub which
+    # release is "latest" -- and that path is hardened against transient failures.
+    local declared_version="" version_source=""
+    if [[ -n "${VERSION:-}" ]]; then
+        declared_version="${VERSION}"
+        version_source="${CONF_FILE}"
+    elif [[ -s "${VERSION_FILE}" ]]; then
+        declared_version="$(tr -d '[:space:]' < "${VERSION_FILE}")"
+        version_source="${VERSION_FILE}"
+    fi
 
-    success "Verified release tag ${LATEST_TAG}"
+    if [[ -n "${declared_version}" ]]; then
+        info "Version source: explicit local declaration"
+        info "  ${declared_version} (from ${version_source})"
+        resolve_release_tag_from_version "${declared_version}"
+    else
+        info "Version source: GitHub latest-release (no local VERSION declared)"
+        fetch_latest_release_metadata
+        git -C "${REPO_DIR}" rev-parse -q --verify "refs/tags/${LATEST_TAG}" >/dev/null \
+            || error "Release tag '${LATEST_TAG}' from GitHub was not found in ${REPO_DIR} after fetching tags."
+    fi
+
+    success "Selected release tag: ${LATEST_TAG} (Chromium ${LATEST_VERSION})"
+}
+
+resolve_release_tag_from_version() {
+    # Turn an explicit Chromium version (e.g. 149.0.7827.102) into a concrete
+    # upstream release tag using local git tags only -- no GitHub API.
+    #
+    # Published release tags are "<chromium-version>-<wrapper-rev>" (e.g.
+    # 149.0.7827.102-1.1), and that suffixed form is what GitHub's latest-release
+    # returns and what the built-version marker records. Some versions ALSO carry
+    # a bare "<version>" tag pointing at the same commit, but the suffixed tag is
+    # the canonical release identity, so prefer it (highest wrapper rev). Fall
+    # back to the bare tag only if no suffixed tag exists.
+    local version="${1}" tags count
+    LATEST_VERSION="${version}"
+
+    tags="$(git -C "${REPO_DIR}" tag -l "${version}-*" | sort -V)"
+    count="$(printf '%s' "${tags}" | grep -c . || true)"
+
+    if [[ "${count}" -ge 1 ]]; then
+        LATEST_TAG="$(printf '%s\n' "${tags}" | tail -n 1)"
+        [[ "${count}" -eq 1 ]] || warn "Multiple tags match '${version}-*'; using the highest: ${LATEST_TAG}"
+    elif git -C "${REPO_DIR}" rev-parse -q --verify "refs/tags/${version}" >/dev/null; then
+        LATEST_TAG="${version}"
+    else
+        error "No upstream release tag matches local version '${version}'.
+  Looked for '${version}-*' and 'refs/tags/${version}' in ${REPO_DIR}.
+  Set VERSION in ${CONF_FILE} / ${VERSION_FILE} to a real ungoogled-chromium-macos
+  release, or unset it to fall back to GitHub latest-release discovery."
+    fi
+
+    info "Resolved release tag from local version: ${LATEST_TAG}"
 }
 
 update_version_markers() {
@@ -1586,8 +1663,7 @@ main() {
 
             section "restoring source and patches"
             validate_repo_layout
-            fetch_latest_release_metadata
-            ensure_release_tag_exists
+            select_release_tag
             update_version_markers
             align_repo_to_latest_release
             validate_post_checkout_layout
@@ -1613,10 +1689,7 @@ main() {
             validate_existing_update_checkout
             check_update_dirty_state
 
-            section "checking upstream release"
-            explain "find the upstream release for this update-build"
-            fetch_latest_release_metadata
-            ensure_release_tag_exists
+            select_release_tag
             update_version_markers
             align_repo_to_latest_release
             validate_post_checkout_layout
