@@ -19,3 +19,6 @@
 
 # Managed/downloaded Chromium checkout and generated build state
 /ungoogled-chromium-macos/
+
+# forge.sh staged-deletion trash (transient; lingers only if a delete could not finish)
+/.forge-trash-*/

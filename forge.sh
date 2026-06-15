@@ -520,6 +520,68 @@ validate_repo_layout() {
     success "Upstream checkout is ready"
 }
 
+robust_remove_tree() {
+    # Move-then-delete. On a Spotlight-indexed external volume, Finder / Desktop
+    # Services can write .DS_Store into directories as rm empties them (even with
+    # only the project root open in Finder, folder traversal / size / indexing
+    # work can reach deep dirs), so the parent rmdir then fails "Directory not
+    # empty" and a single rm -rf cannot finish.
+    #
+    # We:
+    #   1) atomically rename the live path to a hidden, dot-prefixed sibling. The
+    #      rename frees the live path instantly, and the dot prefix keeps Finder
+    #      from listing or traversing the staged copy, so it stops dropping new
+    #      .DS_Store into it.
+    #   2) rm -rf the staged copy, sweeping .DS_Store between attempts in case
+    #      indexing/Finder still races us.
+    #   3) stop loudly if anything survives. rm failures are never hidden.
+    #
+    # Callers MUST run the path guards and the running-build guard first; this
+    # re-checks the essential path invariants so it is safe if reused.
+    local target="${1}" label="${2}" staging attempt rm_status
+
+    [[ -n "${target}" ]]                 || error "Refusing to ${label}: empty target path."
+    [[ "${target}" = /* ]]               || error "Refusing to ${label}: target not absolute: ${target}"
+    [[ "${target}" != "/" ]]             || error "Refusing to ${label}: target is /."
+    [[ "${target}" != "${SCRIPT_DIR}" ]] || error "Refusing to ${label}: target is SCRIPT_DIR: ${target}"
+    [[ -d "${target}" ]]                 || error "Refusing to ${label}: target is not a directory: ${target}"
+
+    # Unique, hidden sibling inside SCRIPT_DIR -> same volume -> atomic rename.
+    staging="${SCRIPT_DIR}/.forge-trash-$(basename "${target}")-$$-$(date +%Y%m%d_%H%M%S)"
+    [[ ! -e "${staging}" ]] || error "Refusing to ${label}: staging path already exists: ${staging}"
+
+    info "Staging for deletion: ${target}"
+    info "             -> ${staging}"
+    mv "${target}" "${staging}"
+    [[ ! -e "${target}" ]] || error "Could not stage ${label}: live path still present after rename: ${target}"
+
+    info "Deleting staged copy: ${staging}"
+    for attempt in 1 2 3 4 5; do
+        rm_status=0
+        rm -rf "${staging}" || rm_status=$?
+        [[ -e "${staging}" ]] || break
+
+        warn "Staged cleanup needed another pass on attempt ${attempt} (rm exit ${rm_status}); sweeping .DS_Store and retrying."
+        find "${staging}" -name '.DS_Store' -delete \
+            || warn "Could not sweep all .DS_Store under ${staging}"
+        sleep 1
+    done
+
+    if [[ -e "${staging}" ]]; then
+        warn "Remaining after staged cleanup of ${label}:"
+        report_tree_sample "${staging}"
+        error "Could not fully delete ${staging} (staged from ${target}).
+  The live path is already cleared, but this staged copy could not be removed.
+  A Finder window or indexing on this external volume is most likely recreating
+  .DS_Store files as fast as rm deletes them.
+  Close any Finder windows under ${SCRIPT_DIR}, let indexing settle, then delete:
+    ${staging}
+  forge.sh stopped rather than leave this hidden."
+    fi
+
+    success "Cleared (${label})"
+}
+
 safe_remove_repo_dir() {
     local target="${REPO_DIR}"
     local expected="${SCRIPT_DIR}/ungoogled-chromium-macos"
@@ -545,8 +607,9 @@ safe_remove_repo_dir() {
     # Never delete a tree a live browser is still running from.
     assert_no_running_build_output "delete the generated checkout"
 
-    info "Clearing generated checkout: ${target}"
-    rm -rf "${target}"
+    # Move-then-delete to survive .DS_Store recreation races on this external
+    # volume (see robust_remove_tree).
+    robust_remove_tree "${target}" "delete the generated checkout"
 
     [[ ! -e "${target}" ]] || error "Could not finish repo cleanup: ${target}"
     success "Generated checkout cleared: ${target}"
