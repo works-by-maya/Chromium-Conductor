@@ -588,10 +588,10 @@ index 98596bc..5873a9f 100644
  TEST_F(RenderFrameAudioOutputStreamFactoryTest,
         MacAudioOutputDeviceUidSwitchOverridesStreamDeviceWhenValid) {
    base::test::ScopedCommandLine scoped_command_line;
-@@ -345,6 +375,128 @@ TEST_F(RenderFrameAudioOutputStreamFactoryTest,
+@@ -345,5 +375,128 @@ TEST_F(RenderFrameAudioOutputStreamFactoryTest,
              audio_service_stream_factory_.last_output_device_id());
  }
- 
++
 +TEST_F(RenderFrameAudioOutputStreamFactoryTest,
 +       MacAudioOutputDeviceUidPerTabSelectionOverridesSwitchForStream) {
 +  base::test::ScopedCommandLine scoped_command_line;
