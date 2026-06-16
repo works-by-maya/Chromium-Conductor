@@ -4,6 +4,10 @@ Conductor is my custom Apple silicon-only build of [ungoogled-chromium-macos](ht
 
 The goal is straightforward: Build a lean, optimized Apple silicon web browser, and add Core Audio routing features that are not available in Google Chrome, Chromium, or ungoogled-chromium-macos.
 
+![Chromium Conductor's "Send Audio To" submenu open on a YouTube tab, listing available Core Audio output devices](assets/conductor-yt.png)
+
+*Per-tab audio routing: sending a YouTube tab to a chosen Core Audio output device via the "Send Audio To" tab menu.*
+
 ## Key Features
 
 - **Native Per-Tab Audio Routing**: Route different tabs to different audio devices simultaneously.
