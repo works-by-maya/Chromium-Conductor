@@ -18,6 +18,9 @@
 .conductor-last-built-version
 # Legacy (pre-rename) marker; kept ignored during the forge.sh -> conductor.sh transition.
 .forge-last-built-version
+# Generated local version state: the release this machine last selected. Conductor
+# builds the latest upstream release by default, so this is not a committed pin.
+version.txt
 
 # Managed/downloaded Chromium checkout and generated build state
 /ungoogled-chromium-macos/

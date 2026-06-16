@@ -52,7 +52,6 @@
 #
 #   conductor.sh
 #   conductor.conf
-#   version.txt
 #   flags.macos.gn
 #   patches.local/
 #
@@ -65,6 +64,7 @@
 #   ungoogled-chromium-macos/
 #   ungoogled-chromium-macos/build/src/
 #   out/
+#   version.txt   (records the release this machine last selected)
 #
 # If they disappear, conductor.sh will recreate them.
 #
@@ -160,7 +160,6 @@ JOBS=""
 ARCH=""
 ARCH_GN=""
 ARCH_RESOURCE=""
-VERSION=""
 LATEST_TAG=""
 LATEST_VERSION=""
 MODE="full"
@@ -317,7 +316,6 @@ These files are the project:
 
   conductor.sh
   conductor.conf
-  version.txt
   flags.macos.gn
   patches.local/
 
@@ -328,6 +326,7 @@ These are generated or downloaded:
   ungoogled-chromium-macos/
   ungoogled-chromium-macos/build/src/
   out/
+  version.txt   (records the release this machine last selected)
 
 If they disappear, conductor.sh will recreate them.
 
@@ -534,7 +533,9 @@ validate_host_layout() {
     require_command python3
 
     require_file "${CONF_FILE}"
-    require_file "${VERSION_FILE}"
+    # version.txt is NOT required: it is generated, gitignored local state that
+    # records the last release this machine selected. A fresh clone does not ship
+    # it, and the latest-release-first flow does not need it to do a first build.
     require_file "${FLAGS_MACOS}"
     require_dir "${LOCAL_PATCHES_DIR}"
     require_file "${LOCAL_PATCHES_SERIES}"
@@ -542,7 +543,6 @@ validate_host_layout() {
 
     info "Script directory: ${SCRIPT_DIR}"
     info "Config file: ${CONF_FILE}"
-    info "Version file: ${VERSION_FILE}"
     info "Build flags: ${FLAGS_MACOS}"
     info "Local patches: ${LOCAL_PATCHES_DIR}"
 }
@@ -859,55 +859,6 @@ load_config() {
     esac
 }
 
-validate_local_version_consistency() {
-    section "checking local version files"
-    explain "stop before deleting or building if the version files disagree"
-
-    # conductor.conf and version.txt should agree. If generated Chromium files are
-    # present, their Chromium version should agree too.
-    local conf_version="${VERSION:-}"
-    local marker_version=""
-    local checkout_version=""
-    local checkout_version_file="${MAIN_REPO}/chromium_version.txt"
-
-    [[ -n "${conf_version}" ]] || error "conductor.conf is missing VERSION. Set VERSION=\"...\" in ${CONF_FILE}."
-
-    if [[ -s "${VERSION_FILE}" ]]; then
-        marker_version="$(tr -d '[:space:]' < "${VERSION_FILE}")"
-    fi
-    [[ -n "${marker_version}" ]] || error "version.txt is empty or missing. Set the expected Chromium version in ${VERSION_FILE}."
-
-    info "Expected (conductor.conf VERSION): ${conf_version}"
-    info "Expected (version.txt):        ${marker_version}"
-
-    if [[ "${conf_version}" != "${marker_version}" ]]; then
-        error "local version declarations disagree.
-  expected (conductor.conf VERSION): ${conf_version}
-    from ${CONF_FILE}
-  expected (version.txt):        ${marker_version}
-    from ${VERSION_FILE}
-  Update one of these so both files state the same Chromium version, then run ./conductor.sh again."
-    fi
-
-    if [[ -f "${checkout_version_file}" ]]; then
-        checkout_version="$(tr -d '[:space:]' < "${checkout_version_file}")"
-        info "Detected (generated checkout): ${checkout_version}"
-
-        if [[ -n "${checkout_version}" && "${checkout_version}" != "${conf_version}" ]]; then
-            error "local checkout version does not match Chromium Conductor's declared version.
-  expected: ${conf_version}
-    from ${CONF_FILE} and ${VERSION_FILE}
-  detected: ${checkout_version}
-    from ${checkout_version_file}
-  Update ${CONF_FILE} and ${VERSION_FILE} to match the checkout, or refresh the checkout to match the declared version, before running ./conductor.sh again."
-        fi
-    else
-        info "No local checkout version file at ${checkout_version_file}; nothing to compare against"
-    fi
-
-    success "Local version declarations are consistent"
-}
-
 check_for_update() {
     section "checking upstream release"
     explain "read-only check: ask GitHub for latest release and compare it with the last successful build"
@@ -1071,8 +1022,8 @@ print(data.get("tag_name", "") if isinstance(data, dict) else "")
         fi
         error "${fail_reason}
   ${UNGOOGLED_RELEASES_API}
-  This is often a transient GitHub outage (e.g. HTTP 5xx). Retry later, or set
-  VERSION in ${CONF_FILE} (and ${VERSION_FILE}) to build a specific release."
+  This is often a transient GitHub outage (e.g. HTTP 5xx). Please check your
+  network/GitHub status and try again."
     fi
 
     LATEST_TAG="${parsed_tag}"
@@ -1096,9 +1047,10 @@ select_release_tag() {
     # current upstream macOS release with no manual version editing, so ask GitHub
     # which release is newest (soft: a failure returns non-zero instead of aborting),
     # then confirm that tag is present in the tags we just fetched before trusting
-    # it. The committed VERSION is a resilient FALLBACK, not a pin: it is consulted
-    # only when discovery is unavailable, so a transient GitHub outage cannot block a
-    # build -- and, per 0940f5c, cannot crash the script.
+    # it. There is no committed version pin: if discovery fails, the only fallback is
+    # a release this machine already selected locally (version.txt), and absent even
+    # that we stop with a friendly error rather than build something stale. Per
+    # 0940f5c, a failed lookup still cannot crash the script.
     local picked_latest=0
     if fetch_latest_release_metadata soft; then
         if git -C "${REPO_DIR}" rev-parse -q --verify "refs/tags/${LATEST_TAG}" >/dev/null; then
@@ -1113,24 +1065,21 @@ select_release_tag() {
     fi
 
     if (( ! picked_latest )); then
-        # Fallback: resolve the declared version (conductor.conf VERSION, else
-        # version.txt) to a concrete tag using local git tags only -- the resilient
-        # 0940f5c path, no GitHub API.
-        local declared_version="" version_source=""
-        if [[ -n "${VERSION:-}" ]]; then
-            declared_version="${VERSION}"
-            version_source="${CONF_FILE}"
-        elif [[ -s "${VERSION_FILE}" ]]; then
+        # Upstream discovery failed. Fall back ONLY to a release this machine has
+        # already selected locally -- version.txt is generated, gitignored state,
+        # written after a successful selection. We deliberately do NOT fall back to
+        # any committed value: a fresh clone must not silently build a stale pin.
+        # If there is no local selection yet (e.g. a first build while offline),
+        # stop with a clear, friendly message instead of guessing.
+        local declared_version=""
+        if [[ -s "${VERSION_FILE}" ]]; then
             declared_version="$(tr -d '[:space:]' < "${VERSION_FILE}")"
-            version_source="${VERSION_FILE}"
         fi
 
-        [[ -n "${declared_version}" ]] || error "Could not discover the latest upstream release, and no local VERSION is declared.
-  Set VERSION in ${CONF_FILE} (and ${VERSION_FILE}) to a real ungoogled-chromium-macos
-  release, or retry when GitHub is reachable."
+        [[ -n "${declared_version}" ]] || error "Could not determine the latest upstream macOS release. Please check your network/GitHub status and try again."
 
-        info "Version source: local declaration (fallback)"
-        info "  ${declared_version} (from ${version_source})"
+        info "Version source: last locally selected release (offline fallback)"
+        info "  ${declared_version} (from ${VERSION_FILE})"
         resolve_release_tag_from_version "${declared_version}"
     fi
 
@@ -1159,36 +1108,26 @@ resolve_release_tag_from_version() {
     elif git -C "${REPO_DIR}" rev-parse -q --verify "refs/tags/${version}" >/dev/null; then
         LATEST_TAG="${version}"
     else
-        error "No upstream release tag matches the declared version '${version}'.
+        error "No upstream release tag matches the locally recorded version '${version}'.
   Looked for '${version}-*' and 'refs/tags/${version}' in ${REPO_DIR}.
-  This fallback runs only when upstream latest-release discovery is unavailable.
-  Retry when GitHub is reachable, or set VERSION in ${CONF_FILE} / ${VERSION_FILE}
-  to a real ungoogled-chromium-macos release."
+  This offline fallback uses version.txt (local state) and that value matches no
+  upstream tag. Retry when GitHub is reachable to select the latest release."
     fi
 
     info "Resolved release tag from local version: ${LATEST_TAG}"
 }
 
 update_version_markers() {
-    section "updating local version files"
-    explain "record the Chromium version this run is building"
+    section "updating local version state"
+    explain "record the selected release as generated, local version state"
 
-    # conductor.conf and version.txt are authored project files. Keep them in sync
-    # with the upstream release this run is about to build.
-    if grep -q '^VERSION=' "${CONF_FILE}"; then
-        sed -i.bak "s/^VERSION=.*/VERSION=\"${LATEST_VERSION}\"/" "${CONF_FILE}"
-        rm -f "${CONF_FILE}.bak"
-        info "Updated ${CONF_FILE} VERSION=\"${LATEST_VERSION}\""
-    else
-        printf '\nVERSION="%s"\n' "${LATEST_VERSION}" >> "${CONF_FILE}"
-        info "Added VERSION=\"${LATEST_VERSION}\" to ${CONF_FILE}"
-    fi
-
+    # version.txt is generated, gitignored local state: the version this run just
+    # selected. We write it AFTER a release has been successfully selected, so a
+    # failed selection never leaves a version behind. conductor.conf is committed
+    # configuration and is intentionally NOT rewritten here -- a build must never
+    # dirty a tracked file or re-introduce a committed version pin.
     printf '%s\n' "${LATEST_VERSION}" > "${VERSION_FILE}"
-    info "Updated ${VERSION_FILE}"
-
-    # shellcheck disable=SC2034 # Keep the sourced config variable in sync for this run.
-    VERSION="${LATEST_VERSION}"
+    info "Recorded selected version in ${VERSION_FILE} (local state): ${LATEST_VERSION}"
 }
 
 align_repo_to_latest_release() {
@@ -1743,7 +1682,6 @@ main() {
     validate_host_layout
     migrate_legacy_state
     load_config
-    validate_local_version_consistency
 
     case "${MODE}" in
         check)
