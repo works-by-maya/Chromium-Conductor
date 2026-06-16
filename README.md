@@ -2,7 +2,14 @@
 
 Conductor is my custom Apple silicon-only build of [ungoogled-chromium-macos](https://github.com/ungoogled-software/ungoogled-chromium-macos).
 
-The goal is straightforward: Build a lean, optimized Apple silicon web browser, and add CoreAudio routing features that are not available in Google Chrome, Chromium, or ungoogled-chromium-macos.
+The goal is straightforward: Build a lean, optimized Apple silicon web browser, and add Core Audio routing features that are not available in Google Chrome, Chromium, or ungoogled-chromium-macos.
+
+## Key Features
+
+- **Native Per-Tab Audio Routing**: Route different tabs to different audio devices simultaneously.
+- **No Third-Party Virtual Cables**: Works natively via macOS Core Audio without needing external software.
+- **Privacy-First Codebase**: Retains 100% of ungoogled-chromium's privacy defaults, and anti-telemetry protections.
+- **Optimized for Apple silicon**: Built for ARM64 with ThinLTO compiler optimizations.
 
 ## Why?
 
@@ -10,7 +17,7 @@ Most of my listening happens via audio files, and physical media.
 
 Every so often, I'll come across something on the web that deserves to be shot out to the stereo.
 
-Conductor exists solely because I wanted the browser itself to have its own native, built-in audio routing, and not rely on third party software.
+Conductor exists solely because I wanted the browser itself to have its own native, built-in audio routing, and not rely on third-party software.
 
 ## Custom Changes
 
@@ -18,7 +25,7 @@ This build currently includes two local patches.
 
 ### mac-audio-output-device-uid-switch.patch
 
-Adds support for selecting a specific CoreAudio output device.
+Adds support for selecting a specific Core Audio output device.
 
 This allows the browser to target a chosen audio device instead of relying entirely on the system default.
 
@@ -26,7 +33,7 @@ This allows the browser to target a chosen audio device instead of relying entir
 
 Adds a macOS-only **Send Audio To** submenu to the tab context menu.
 
-Audio output can be assigned on a per-tab basis and switched between available output devices.
+Audio output can be assigned on a per-tab basis, and switched between available output devices.
 
 ## Build Configuration
 
@@ -63,53 +70,82 @@ The script handles:
 
 My goal is to make Chromium builds predictable, repeatable, and easy to recover if something goes wrong.
 
-## Notable Files
+### Notable Files
 
-```text
-conductor.sh
-```
-
-This is the build and maintenance script.
-
-```text
-flags.macos.gn
-```
-
-Apple silicon build configuration.
-
-```text
-patches.local/
-```
-
-My local Chromium Conductor patches.
+| File | Purpose |
+|--------|--------|
+| `conductor.sh` | Build and maintenance script |
+| `flags.macos.gn` | Apple silicon build configuration |
+| `patches.local/` | Local Chromium Conductor patches |
+| `conductor.conf` | Local build configuration |
 
 ## Prerequisites
 
-Conductor is developed and supported for Apple silicon (arm64) Macs only. The build configuration exposes an `ARCH` setting in `conductor.conf`, but Intel (`x64`) builds are neither tested nor supported — treat Apple silicon as the only supported target.
+Chromium Conductor is developed and supported on **Apple silicon (ARM64) Macs** only.
 
-If Xcode is not already installed, install it from the Mac App Store first.
+While the build configuration exposes an `ARCH` setting in `conductor.conf`, Intel (`x64`) builds are neither tested nor supported.
 
-After Xcode finishes installing, launch it at least once, and allow any additional components to install. Xcode may also ask you to accept Apple's license agreement.
+### Hardware Requirements
 
-Next, open Terminal, and install the Xcode Command Line Tools:
+Building Chromium is resource-intensive.
+
+Recommended:
+
+- 32 GB RAM minimum
+- 64 GB RAM recommended
+- 100 GB free disk space minimum
+- 150 GB+ free disk space recommended
+- Reliable internet connection
+
+### Development Machine
+
+Chromium Conductor is primarily developed on:
+
+- Mac mini M4 Pro
+- 64 GB RAM
+- Current macOS release (macOS Tahoe 26.5.1 at time of project inception)
+
+Build times will vary depending on hardware. Personally, in ~4 hours I have a completed build.
+
+### Required Software
+
+#### 1. Install Xcode
+
+Install Xcode from the Mac App Store.
+
+Launch Xcode once after installation, and allow any additional components to install. Xcode may also prompt you to accept Apple's license agreement.
+
+#### 2. Install Xcode Command Line Tools
 
 ```bash
 xcode-select --install
 ```
 
-Install Homebrew:
+The Command Line Tools provide:
+
+- git
+- clang
+- make
+- xcode-select
+- other standard developer tools used by Chromium's build system
+
+#### 3. Install Homebrew
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 ```
 
-Install GNU coreutils:
+#### 4. Install GNU Coreutils
+
+Chromium Conductor uses `greadlink`; it is provided by GNU Coreutils.
 
 ```bash
 brew install coreutils
 ```
 
-Verify everything is available:
+### Verify Your Environment
+
+The following commands should all succeed:
 
 ```bash
 xcode-select -p
@@ -119,15 +155,30 @@ python3 --version
 greadlink --version
 ```
 
-You'll also need:
+Expected sources:
 
-- **A network connection.** The first build downloads the Chromium source, toolchains, and build dependencies, and contacts GitHub to discover the latest upstream release. A first-time build cannot run offline.
-- **Free disk space — plan for at least ~100 GB.** The Chromium source, toolchains, and build output together are large; 150 GB or more is comfortable.
-- Patience.
+| Tool | Source |
+|--------|--------|
+| xcode-select | Xcode Command Line Tools |
+| brew | Homebrew |
+| git | Xcode Command Line Tools |
+| python3 | macOS / Chromium tooling environment |
+| greadlink | GNU Coreutils |
 
-The build script handles the rest.
+If any command fails, resolve the missing dependency before continuing.
 
-Please note the initial build can take several hours.
+### Quick Sanity Check
+
+This command should report all required tools:
+
+```bash
+which git
+which python3
+which greadlink
+which brew
+```
+
+Once everything above succeeds, you're ready to build Chromium Conductor. 🥳
 
 ## Getting Started
 
@@ -143,19 +194,17 @@ cd ~/Projects/Chromium-Conductor
 Clone the repository:
 
 ```bash
-git clone https://github.com/<owner>/Chromium-Conductor.git
+git clone https://github.com/works-by-maya/Chromium-Conductor.git
 cd Chromium-Conductor
 ```
-
-Replace `<owner>` with the GitHub account or organization that hosts the repository.
 
 ## Building
 
 The initial build downloads Chromium source, toolchains, build dependencies, applies patches, generates build files, and compiles the browser.
 
-On my Apple silicon M4 Pro Mac mini with 64 GB of RAM, a clean build can take several hours. If this is your first build, plan accordingly.
+A clean build can take several hours. If this is your first build, plan accordingly.
 
-Every build contacts GitHub to discover the latest upstream ungoogled-chromium-macos release, then builds that release. There is no committed version to edit — Conductor always targets the current upstream macOS release, and a first-time build therefore needs a network connection.
+Every build contacts GitHub to discover the latest upstream ungoogled-chromium-macos release, then builds that release. Conductor always targets the current upstream macOS release; a first-time build therefore requires a network connection.
 
 Initially, you build from scratch:
 
@@ -163,7 +212,27 @@ Initially, you build from scratch:
 ./conductor.sh
 ```
 
-> **Warning — `./conductor.sh` is a full clean rebuild.** It **deletes the generated checkout** (`ungoogled-chromium-macos/`) and rebuilds from scratch, which takes hours. As a safeguard it refuses to run while a browser launched from that checkout is still open, but otherwise it discards the existing checkout. Once you already have a working build, use `--update-build` (below) to refresh it instead of starting over.
+> **Warning — `./conductor.sh` performs a full clean rebuild.**
+>
+> It **deletes the generated checkout** (`ungoogled-chromium-macos/`) and rebuilds from scratch, which takes hours.
+>
+> I usually run this overnight or in the background while I work.
+>
+> If you are testing directly from the generated build output, quit that browser first. The script has safeguards for active build-output browsers, but it otherwise discards, and recreates the checkout.
+>
+> Once you already have a working build, use `--update-build` (below) to refresh it instead of starting over.
+
+When the build finishes, you'll find the app at:
+
+```text
+ungoogled-chromium-macos/build/src/out/Default/Chromium.app
+```
+
+Install it by dragging `Chromium.app` into `/Applications`, or copy it from the terminal:
+
+```bash
+cp -R ungoogled-chromium-macos/build/src/out/Default/Chromium.app /Applications/
+```
 
 Verify build state:
 
@@ -189,6 +258,12 @@ Update source and rebuild — use this once you already have a working checkout,
 ./conductor.sh --update-build
 ```
 
+Show usage and all available commands:
+
+```bash
+./conductor.sh --help
+```
+
 ## Status
 
 Always under active development.
@@ -197,13 +272,13 @@ Always under active development.
 
 Chromium Conductor is a personal project built from a labor of love, and music.
 
-Although I developed this solely for my own use, I am not accepting pull requests nor external contributions at this time.
+I developed it solely for my own use, so I'm not accepting pull requests or external contributions at this time.
 
 However, if you'd like to experiment with the ideas here, please feel free to fork the project to build your own version.
 
 ## Privacy
 
-Conductor inherits ungoogled-chromium's privacy posture, and adds nothing that undermines it:
+Conductor builds on ungoogled-chromium's privacy work, and doesn't undo any of it:
 
 - No telemetry, no usage reporting, no crash uploads.
 - No Google account integration or background sign-in.
@@ -221,9 +296,9 @@ Chromium Conductor is downstream of these projects and owes them everything exce
 
 - **[Chromium](https://www.chromium.org/)** — the open-source browser engine, licensed under BSD-3-Clause.
 - **[ungoogled-chromium](https://github.com/ungoogled-software/ungoogled-chromium)** — Chromium with Google integration removed and privacy defaults tightened.
-- **[ungoogled-chromium-macos](https://github.com/ungoogled-software/ungoogled-chromium-macos)** — the macOS build of the above, and the base `conductor.sh` clones and builds.
+- **[ungoogled-chromium-macos](https://github.com/ungoogled-software/ungoogled-chromium-macos)** — the macOS build of the above, and the base that `conductor.sh` clones and builds.
 
-Conductor is not affiliated with nor endorsed by Google or the ungoogled-software project. Please don't report Conductor-specific issues to them, as they do not maintain this project's custom patches or build system.
+Conductor is neither affiliated with nor endorsed by Google or the ungoogled-software project. Please don't report Conductor-specific issues to those projects; they don't maintain Conductor's custom patches or build system.
 
 ---
 
