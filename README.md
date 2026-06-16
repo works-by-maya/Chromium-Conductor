@@ -85,7 +85,7 @@ My local Chromium Conductor patches.
 
 ## Prerequisites
 
-Conductor currently targets Apple silicon Macs.
+Conductor is developed and supported for Apple silicon (arm64) Macs only. The build configuration exposes an `ARCH` setting in `conductor.conf`, but Intel (`x64`) builds are neither tested nor supported — treat Apple silicon as the only supported target.
 
 If Xcode is not already installed, install it from the Mac App Store first.
 
@@ -121,8 +121,9 @@ greadlink --version
 
 You'll also need:
 
-- free disk space
-- patience
+- **A network connection.** The first build downloads the Chromium source, toolchains, and build dependencies, and contacts GitHub to discover the latest upstream release. A first-time build cannot run offline.
+- **Free disk space — plan for at least ~100 GB.** The Chromium source, toolchains, and build output together are large; 150 GB or more is comfortable.
+- Patience.
 
 The build script handles the rest.
 
@@ -142,9 +143,11 @@ cd ~/Projects/Chromium-Conductor
 Clone the repository:
 
 ```bash
-git clone https://github.com/YOURNAME/Chromium-Conductor.git
+git clone https://github.com/<owner>/Chromium-Conductor.git
 cd Chromium-Conductor
 ```
+
+Replace `<owner>` with the GitHub account or organization that hosts the repository.
 
 ## Building
 
@@ -152,11 +155,15 @@ The initial build downloads Chromium source, toolchains, build dependencies, app
 
 On my Apple silicon M4 Pro Mac mini with 64 GB of RAM, a clean build can take several hours. If this is your first build, plan accordingly.
 
+Every build contacts GitHub to discover the latest upstream ungoogled-chromium-macos release, then builds that release. There is no committed version to edit — Conductor always targets the current upstream macOS release, and a first-time build therefore needs a network connection.
+
 Initially, you build from scratch:
 
 ```bash
 ./conductor.sh
 ```
+
+> **Warning — `./conductor.sh` is a full clean rebuild.** It **deletes the generated checkout** (`ungoogled-chromium-macos/`) and rebuilds from scratch, which takes hours. As a safeguard it refuses to run while a browser launched from that checkout is still open, but otherwise it discards the existing checkout. Once you already have a working build, use `--update-build` (below) to refresh it instead of starting over.
 
 Verify build state:
 
@@ -176,7 +183,7 @@ Clean generated source and build artifacts:
 ./conductor.sh --clean
 ```
 
-Update source and rebuild:
+Update source and rebuild — use this once you already have a working checkout, instead of a full rebuild. It keeps the existing checkout, refreshes the generated source to the latest upstream release, reapplies patches, preserves the build cache where possible, and rebuilds. It requires an existing build; on a fresh clone it will tell you to run `./conductor.sh` first.
 
 ```bash
 ./conductor.sh --update-build
@@ -201,6 +208,8 @@ Conductor inherits ungoogled-chromium's privacy posture, and adds nothing that u
 - No telemetry, no usage reporting, no crash uploads.
 - No Google account integration or background sign-in.
 - The audio routing feature stores your per-tab choices locally and sends nothing anywhere.
+
+The points above describe the browser Conductor produces. Separately, the **build process** does use the network: it contacts GitHub to discover the latest upstream release and downloads the Chromium source and toolchains. That is required to build from source — it is not telemetry, and none of it happens when you run the resulting browser.
 
 If you find behavior that contradicts any of the above, please open an issue — that's a bug, not a feature.
 
