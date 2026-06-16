@@ -1012,32 +1012,39 @@ extract_chromium_version_from_tag() {
 }
 
 fetch_latest_release_metadata() {
-    section "checking upstream release"
-    explain "ask GitHub which upstream release to use"
+    # Discover the newest upstream ungoogled-chromium-macos release via the GitHub
+    # REST API and populate LATEST_TAG / LATEST_VERSION.
+    #
+    # Failure DISPOSITION is caller-selected; the hardening is identical either way:
+    #   (default) "fatal" -- abort with a friendly message. Used by --check.
+    #   "soft"            -- return non-zero so the caller can fall back, e.g.
+    #                        select_release_tag dropping to the declared version.
+    #
+    # Per 0940f5c, the transfer and the JSON parse are each validated before use,
+    # so a transient outage (e.g. HTTP 504, empty body) becomes a clear message or
+    # a clean non-zero return -- never a Python traceback or a crash under set -e.
+    local disposition="${1:-fatal}"
 
-    # GitHub release metadata is consulted only when no explicit local version is
-    # declared (see select_release_tag). Validate the transfer and the JSON
-    # before parsing, so a transient outage (e.g. HTTP 504) becomes a clear
-    # message instead of a Python traceback on empty input.
+    section "checking upstream release"
+    explain "ask GitHub which upstream release is newest"
     info "Fetching the latest ungoogled-chromium-macos release..."
 
-    local response
+    # Collect any failure into one reason, then dispatch once at the end. The
+    # globals are written only on full success, so a failure never leaves partial
+    # state behind for a fallback caller to misread.
+    local response="" parsed_tag="" parsed_version="" fail_reason=""
+
     if ! response="$(curl -fsSL "${UNGOOGLED_RELEASES_API}")"; then
-        error "Could not reach GitHub to discover the latest release (curl failed):
-  ${UNGOOGLED_RELEASES_API}
-  This is often a transient GitHub outage (e.g. HTTP 5xx). Retry later, or set
-  VERSION in ${CONF_FILE} (and ${VERSION_FILE}) to build a specific release
-  without GitHub discovery."
+        fail_reason="Could not reach GitHub to discover the latest release (curl failed)."
+    elif [[ -z "${response}" ]]; then
+        fail_reason="GitHub returned an empty latest-release response."
     fi
 
-    [[ -n "${response}" ]] || error "GitHub returned an empty latest-release response:
-  ${UNGOOGLED_RELEASES_API}
-  Retry later, or set VERSION in ${CONF_FILE} to build a specific release."
-
-    # Parse in a separate step from the transfer. Any non-JSON / unexpected shape
-    # exits 2 (no traceback), which the || error below turns into a clean stop.
-    LATEST_TAG="$(
-        printf '%s' "${response}" | python3 -c '
+    if [[ -z "${fail_reason}" ]]; then
+        # Parse in a separate, guarded step. Any non-JSON / unexpected shape exits
+        # 2 (no traceback); the failed substitution is caught here, not by set -e.
+        if ! parsed_tag="$(
+            printf '%s' "${response}" | python3 -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
@@ -1045,51 +1052,86 @@ except Exception:
     sys.exit(2)
 print(data.get("tag_name", "") if isinstance(data, dict) else "")
 ' 2>/dev/null
-    )" || error "GitHub returned a response that was not valid JSON:
+        )"; then
+            fail_reason="GitHub returned a response that was not valid JSON."
+        elif [[ -z "${parsed_tag}" ]]; then
+            fail_reason="GitHub's latest-release response contained no tag_name."
+        fi
+    fi
+
+    if [[ -z "${fail_reason}" ]]; then
+        parsed_version="$(extract_chromium_version_from_tag "${parsed_tag}")"
+        [[ -n "${parsed_version}" ]] || fail_reason="Failed to extract a Chromium version from release tag '${parsed_tag}'."
+    fi
+
+    if [[ -n "${fail_reason}" ]]; then
+        if [[ "${disposition}" == "soft" ]]; then
+            warn "${fail_reason}"
+            return 1
+        fi
+        error "${fail_reason}
   ${UNGOOGLED_RELEASES_API}
-  Retry later, or set VERSION in ${CONF_FILE} to build a specific release."
+  This is often a transient GitHub outage (e.g. HTTP 5xx). Retry later, or set
+  VERSION in ${CONF_FILE} (and ${VERSION_FILE}) to build a specific release."
+    fi
 
-    [[ -n "${LATEST_TAG}" ]] || error "GitHub's latest-release response contained no tag_name."
-
-    LATEST_VERSION="$(extract_chromium_version_from_tag "${LATEST_TAG}")"
-    [[ -n "${LATEST_VERSION}" ]] || error "Failed to extract a Chromium version from release tag '${LATEST_TAG}'"
-
+    LATEST_TAG="${parsed_tag}"
+    LATEST_VERSION="${parsed_version}"
     info "Latest release tag: ${LATEST_TAG}"
     info "Chromium version: ${LATEST_VERSION}"
+    return 0
 }
 
 select_release_tag() {
     section "selecting release tag"
-    explain "prefer the version declared locally; ask GitHub only when none is set"
+    explain "build the latest upstream macOS release; fall back to the declared version only if discovery is unavailable"
 
     # Make every upstream tag available locally first. This uses the git protocol
     # (the same path the clone just used), so it keeps working even when GitHub's
-    # REST API is unavailable (e.g. the HTTP 504 that broke an earlier run). A
-    # clone may not carry every tag, so fetch them explicitly.
+    # REST API is unavailable. A clone may not carry every tag, so fetch them.
     info "Fetching repo tags..."
     git -C "${REPO_DIR}" fetch --tags --prune
 
-    # Prefer an explicit local version. conductor.conf VERSION is the primary source;
-    # version.txt is the fallback. Only when neither is set do we ask GitHub which
-    # release is "latest" -- and that path is hardened against transient failures.
-    local declared_version="" version_source=""
-    if [[ -n "${VERSION:-}" ]]; then
-        declared_version="${VERSION}"
-        version_source="${CONF_FILE}"
-    elif [[ -s "${VERSION_FILE}" ]]; then
-        declared_version="$(tr -d '[:space:]' < "${VERSION_FILE}")"
-        version_source="${VERSION_FILE}"
+    # Latest-release-first. A fresh clone -- and every later run -- should track the
+    # current upstream macOS release with no manual version editing, so ask GitHub
+    # which release is newest (soft: a failure returns non-zero instead of aborting),
+    # then confirm that tag is present in the tags we just fetched before trusting
+    # it. The committed VERSION is a resilient FALLBACK, not a pin: it is consulted
+    # only when discovery is unavailable, so a transient GitHub outage cannot block a
+    # build -- and, per 0940f5c, cannot crash the script.
+    local picked_latest=0
+    if fetch_latest_release_metadata soft; then
+        if git -C "${REPO_DIR}" rev-parse -q --verify "refs/tags/${LATEST_TAG}" >/dev/null; then
+            info "Version source: upstream latest macOS release"
+            info "  ${LATEST_TAG} (Chromium ${LATEST_VERSION})"
+            picked_latest=1
+        else
+            warn "Upstream latest tag '${LATEST_TAG}' is not present in ${REPO_DIR} after fetching tags; falling back to the locally declared version."
+        fi
+    else
+        warn "Upstream latest-release discovery is unavailable; falling back to the locally declared version."
     fi
 
-    if [[ -n "${declared_version}" ]]; then
-        info "Version source: explicit local declaration"
+    if (( ! picked_latest )); then
+        # Fallback: resolve the declared version (conductor.conf VERSION, else
+        # version.txt) to a concrete tag using local git tags only -- the resilient
+        # 0940f5c path, no GitHub API.
+        local declared_version="" version_source=""
+        if [[ -n "${VERSION:-}" ]]; then
+            declared_version="${VERSION}"
+            version_source="${CONF_FILE}"
+        elif [[ -s "${VERSION_FILE}" ]]; then
+            declared_version="$(tr -d '[:space:]' < "${VERSION_FILE}")"
+            version_source="${VERSION_FILE}"
+        fi
+
+        [[ -n "${declared_version}" ]] || error "Could not discover the latest upstream release, and no local VERSION is declared.
+  Set VERSION in ${CONF_FILE} (and ${VERSION_FILE}) to a real ungoogled-chromium-macos
+  release, or retry when GitHub is reachable."
+
+        info "Version source: local declaration (fallback)"
         info "  ${declared_version} (from ${version_source})"
         resolve_release_tag_from_version "${declared_version}"
-    else
-        info "Version source: GitHub latest-release (no local VERSION declared)"
-        fetch_latest_release_metadata
-        git -C "${REPO_DIR}" rev-parse -q --verify "refs/tags/${LATEST_TAG}" >/dev/null \
-            || error "Release tag '${LATEST_TAG}' from GitHub was not found in ${REPO_DIR} after fetching tags."
     fi
 
     success "Selected release tag: ${LATEST_TAG} (Chromium ${LATEST_VERSION})"
@@ -1117,10 +1159,11 @@ resolve_release_tag_from_version() {
     elif git -C "${REPO_DIR}" rev-parse -q --verify "refs/tags/${version}" >/dev/null; then
         LATEST_TAG="${version}"
     else
-        error "No upstream release tag matches local version '${version}'.
+        error "No upstream release tag matches the declared version '${version}'.
   Looked for '${version}-*' and 'refs/tags/${version}' in ${REPO_DIR}.
-  Set VERSION in ${CONF_FILE} / ${VERSION_FILE} to a real ungoogled-chromium-macos
-  release, or unset it to fall back to GitHub latest-release discovery."
+  This fallback runs only when upstream latest-release discovery is unavailable.
+  Retry when GitHub is reachable, or set VERSION in ${CONF_FILE} / ${VERSION_FILE}
+  to a real ungoogled-chromium-macos release."
     fi
 
     info "Resolved release tag from local version: ${LATEST_TAG}"
