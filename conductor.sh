@@ -51,7 +51,7 @@
 # These files are the project:
 #
 #   conductor.sh
-#   forge.conf
+#   conductor.conf
 #   version.txt
 #   flags.macos.gn
 #   patches.local/
@@ -118,7 +118,7 @@ elif [[ -n "${ZSH_VERSION:-}" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname -- "${SCRIPT_SELF}")" && pwd)"
-CONF_FILE="${SCRIPT_DIR}/forge.conf"
+CONF_FILE="${SCRIPT_DIR}/conductor.conf"
 LOG_DIR="${SCRIPT_DIR}/out/logs"
 VERSION_FILE="${SCRIPT_DIR}/version.txt"
 LAST_BUILT_VERSION_FILE="${SCRIPT_DIR}/.conductor-last-built-version"
@@ -316,7 +316,7 @@ How to run it:
 These files are the project:
 
   conductor.sh
-  forge.conf
+  conductor.conf
   version.txt
   flags.macos.gn
   patches.local/
@@ -702,7 +702,7 @@ clean_generated_state() {
 
     # --clean deletes the generated checkout (clone + build/ + build/src + the
     # download cache) — exactly what a full rebuild deletes first. It does NOT
-    # touch authored project files (conductor.sh, forge.conf, version.txt,
+    # touch authored project files (conductor.sh, conductor.conf, version.txt,
     # flags.macos.gn, patches.local/), the preserved logs under out/logs, or the
     # last-built-version marker. It reuses safe_remove_repo_dir, so the same path
     # guards and the running-browser guard apply.
@@ -830,7 +830,7 @@ check_update_dirty_state() {
 }
 
 load_config() {
-    # forge.conf is where this wrapper keeps local build choices: target
+    # conductor.conf is where this wrapper keeps local build choices: target
     # architecture and optional signing/notarization inputs. Source it once,
     # normalize the architecture names, then export signing variables for the
     # upstream helper script if signing is configured.
@@ -863,26 +863,26 @@ validate_local_version_consistency() {
     section "checking local version files"
     explain "stop before deleting or building if the version files disagree"
 
-    # forge.conf and version.txt should agree. If generated Chromium files are
+    # conductor.conf and version.txt should agree. If generated Chromium files are
     # present, their Chromium version should agree too.
     local conf_version="${VERSION:-}"
     local marker_version=""
     local checkout_version=""
     local checkout_version_file="${MAIN_REPO}/chromium_version.txt"
 
-    [[ -n "${conf_version}" ]] || error "forge.conf is missing VERSION. Set VERSION=\"...\" in ${CONF_FILE}."
+    [[ -n "${conf_version}" ]] || error "conductor.conf is missing VERSION. Set VERSION=\"...\" in ${CONF_FILE}."
 
     if [[ -s "${VERSION_FILE}" ]]; then
         marker_version="$(tr -d '[:space:]' < "${VERSION_FILE}")"
     fi
     [[ -n "${marker_version}" ]] || error "version.txt is empty or missing. Set the expected Chromium version in ${VERSION_FILE}."
 
-    info "Expected (forge.conf VERSION): ${conf_version}"
+    info "Expected (conductor.conf VERSION): ${conf_version}"
     info "Expected (version.txt):        ${marker_version}"
 
     if [[ "${conf_version}" != "${marker_version}" ]]; then
         error "local version declarations disagree.
-  expected (forge.conf VERSION): ${conf_version}
+  expected (conductor.conf VERSION): ${conf_version}
     from ${CONF_FILE}
   expected (version.txt):        ${marker_version}
     from ${VERSION_FILE}
@@ -1069,7 +1069,7 @@ select_release_tag() {
     info "Fetching repo tags..."
     git -C "${REPO_DIR}" fetch --tags --prune
 
-    # Prefer an explicit local version. forge.conf VERSION is the primary source;
+    # Prefer an explicit local version. conductor.conf VERSION is the primary source;
     # version.txt is the fallback. Only when neither is set do we ask GitHub which
     # release is "latest" -- and that path is hardened against transient failures.
     local declared_version="" version_source=""
@@ -1130,7 +1130,7 @@ update_version_markers() {
     section "updating local version files"
     explain "record the Chromium version this run is building"
 
-    # forge.conf and version.txt are authored project files. Keep them in sync
+    # conductor.conf and version.txt are authored project files. Keep them in sync
     # with the upstream release this run is about to build.
     if grep -q '^VERSION=' "${CONF_FILE}"; then
         sed -i.bak "s/^VERSION=.*/VERSION=\"${LATEST_VERSION}\"/" "${CONF_FILE}"
@@ -1449,7 +1449,7 @@ write_args_gn() {
 
     # args.gn is generated, not hand-edited. Start from upstream flags, layer the
     # local macOS flags, and then write target_cpu last so the configured ARCH in
-    # forge.conf wins even if either flags file already contains a target_cpu.
+    # conductor.conf wins even if either flags file already contains a target_cpu.
     mkdir -p "${SRC_DIR}/out/Default"
 
     {
@@ -1515,7 +1515,7 @@ build_from_scratch() {
     info "  ChromeDriver: ${SRC_DIR}/out/Default/chromedriver"
 
     if [[ -n "${MACOS_CERTIFICATE_NAME}" ]]; then
-        # Signing is intentionally config-driven. If the local forge.conf does
+        # Signing is intentionally config-driven. If the local conductor.conf does
         # not provide a certificate name, produce unsigned build artifacts
         # instead of guessing at developer identity.
         info "Code signing and packaging..."

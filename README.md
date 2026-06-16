@@ -222,7 +222,7 @@ Conductor is not affiliated with nor endorsed by Google or the ungoogled-softwar
 
 The Chromium source and the ungoogled-chromium modifications retain their existing licenses (Chromium is BSD-3-Clause; see the upstream `LICENSE` files).
 
-<!-- TODO: choose and state the license covering your own work — conductor.sh, forge.conf, flags.macos.gn, and the patches in patches.local/. BSD-3-Clause keeps it consistent with the upstream tree. -->
+<!-- TODO: choose and state the license covering your own work — conductor.sh, conductor.conf, flags.macos.gn, and the patches in patches.local/. BSD-3-Clause keeps it consistent with the upstream tree. -->
 
 ---
 
