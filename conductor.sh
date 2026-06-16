@@ -467,15 +467,16 @@ is_git_worktree() {
 }
 
 # ---------------------------------------------------------------------------
-# Running-build detection
+# Build-output browser detection
 #
 # The build emits Chromium.app and chromedriver under ${SRC_DIR}/out/Default,
-# and that tree usually lives on an external volume. If a browser launched from
-# there is still running when we delete the tree, the process keeps its open
-# files in memory while its on-disk resources vanish underneath it: audio and
-# already-loaded pages keep working, but normal browsing breaks, and the delete
-# itself fails halfway with "Directory not empty". That is the ghost we refuse
-# to create. Detect it, then stop before touching anything.
+# and that tree usually lives on an external volume. A build-output browser is
+# any Chromium (or chromedriver) launched from there. If one is still running
+# when we delete the tree, the process keeps its open files in memory while its
+# on-disk resources vanish underneath it: audio and already-loaded pages keep
+# working, but normal browsing breaks, and the delete itself fails halfway with
+# "Directory not empty". That is the ghost we refuse to create. Detect it, then
+# stop before touching anything.
 # ---------------------------------------------------------------------------
 running_build_output_pids() {
     # Everything this build can launch lives under ${SRC_DIR}/out/Default, so a
@@ -844,6 +845,8 @@ load_config() {
     export PROD_MACOS_NOTARIZATION_TEAM_ID="${PROD_MACOS_NOTARIZATION_TEAM_ID:-}"
     export PROD_MACOS_NOTARIZATION_PWD="${PROD_MACOS_NOTARIZATION_PWD:-}"
 
+    # Apple silicon (arm64) is the supported target. x64/x86_64 is accepted and
+    # normalized here, but per the README it is neither tested nor supported.
     case "${ARCH}" in
         arm64)
             ARCH_GN="arm64"
@@ -1716,6 +1719,11 @@ main() {
             success "Conductor clean complete."
             ;;
         full)
+            # Full clean rebuild (./conductor.sh with no flags): delete the
+            # generated checkout, clone ungoogled-chromium-macos fresh, build the
+            # latest upstream release with the local patch layer applied, then
+            # compile. safe_remove_repo_dir runs the build-output browser guard
+            # before anything is deleted.
             print_run_config
 
             section "refreshing generated checkout"
@@ -1746,8 +1754,14 @@ main() {
             section "done"
             success "Full rebuild complete: ${LATEST_TAG}"
             info "Build completed in $(format_elapsed_since_start)"
+            info "Built app: ${SRC_DIR}/out/Default/Chromium.app (drag it to /Applications to install)."
             ;;
         update-build)
+            # Update build (--update-build): reuse the existing generated
+            # checkout, refresh the generated Chromium source to the latest
+            # upstream release, reapply the local patch layer, and rebuild,
+            # keeping the build-output cache when possible. Requires an existing
+            # checkout; validate_existing_update_checkout stops if there is none.
             print_run_config
             validate_existing_update_checkout
             check_update_dirty_state
@@ -1774,6 +1788,7 @@ main() {
             section "done"
             success "Update-build complete: ${LATEST_TAG}"
             info "Build completed in $(format_elapsed_since_start)"
+            info "Built app: ${SRC_DIR}/out/Default/Chromium.app (drag it to /Applications to install)."
             ;;
         *)
             error "Internal error: unknown mode '${MODE}'"
