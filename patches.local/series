@@ -2,8 +2,5 @@
 #
 # Example:
 # skip-a-feature-we-are-not-building.patch # short inline hint for humans
-#
-# Keep this file empty until a local patch is ready. conductor.sh will simply note
-# that this layer is ready when you are.
 mac-audio-output-device-uid-switch.patch # add macOS audio output UID switch
 mac-audio-output-device-tab-menu.patch # add macOS tab audio output menu

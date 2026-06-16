@@ -26,7 +26,7 @@ new file mode 100644
 index 0000000..eb27422
 --- /dev/null
 +++ b/chrome/browser/ui/tabs/mac_audio_output_device_sub_menu_model.cc
-@@ -0,0 +1,239 @@
+@@ -0,0 +1,241 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -79,6 +79,8 @@ index 0000000..eb27422
 +    return name;
 +  }
 +
++  // Fall back to the legacy device-name property for devices that do not
++  // expose the modern kAudioObjectPropertyName selector.
 +  return GetStringProperty(device_id, kAudioDevicePropertyDeviceNameCFString,
 +                           kAudioObjectPropertyScopeOutput);
 +}
@@ -516,9 +518,13 @@ index 416b912..d194caa 100644
  bool ContainsOutputDeviceUid(
      const media::AudioDeviceDescriptions& device_descriptions,
      const std::string& device_uid) {
-@@ -369,7 +360,7 @@ void RenderFrameAudioOutputStreamFactory::Core::AuthorizationCompleted(
+@@ -369,7 +360,11 @@ void RenderFrameAudioOutputStreamFactory::Core::AuthorizationCompleted(
      const std::string& device_id_for_renderer) {
  #if BUILDFLAG(IS_MAC)
++  // On macOS a non-empty preferred output device UID sends authorization down
++  // an async detour (GetDeviceDescriptions -> ...DescriptionsReceived ->
++  // GetOutputStreamParameters -> ...ParametersReceived); every branch of it,
++  // like the non-macOS path below, converges on FinishAuthorization().
    const std::string preferred_device_uid =
 -      GetMacAudioOutputDeviceUidSwitchValue();
 +      content::GetEffectiveMacAudioOutputDeviceUid(main_frame_token_);
@@ -740,7 +746,7 @@ new file mode 100644
 index 0000000..4c73f3f
 --- /dev/null
 +++ b/content/public/browser/mac_audio_output_device.cc
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,207 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -767,6 +773,11 @@ index 0000000..4c73f3f
 +
 +namespace {
 +
++// Per-tab device selection is owned on the UI thread by the WebContents user
++// data below. Audio stream authorization runs on the IO thread, where only a
++// GlobalRenderFrameHostToken is available, so the UI-thread state mirrors each
++// selection into this global, lock-guarded token->UID map. The map is the
++// thread-safe bridge the IO thread reads; the WebContents state is the truth.
 +struct MacAudioOutputDeviceTabState {
 +  base::Lock lock;
 +  std::map<GlobalRenderFrameHostToken, std::string> device_uids
