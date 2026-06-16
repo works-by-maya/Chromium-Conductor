@@ -3,10 +3,7 @@
 .AppleDouble
 .LSOverride
 
-# Local agent/editor state
-.claude/
-.codex/
-.agents/
+# Local editor state
 .vscode/
 .idea/
 *.swp
