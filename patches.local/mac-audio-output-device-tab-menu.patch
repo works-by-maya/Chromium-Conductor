@@ -1,11 +1,12 @@
 diff --git a/chrome/browser/ui/tabs/BUILD.gn b/chrome/browser/ui/tabs/BUILD.gn
-index 0f5a24d..82077ad 100644
+index 85004b4..3d8209a 100644
 --- a/chrome/browser/ui/tabs/BUILD.gn
 +++ b/chrome/browser/ui/tabs/BUILD.gn
-@@ -119,6 +119,18 @@ if (!is_android) {
+@@ -177,6 +177,18 @@
+       "//components/commerce/core:feature_list",
        "//components/feed:feature_list",
      ]
- 
++
 +    if (is_mac) {
 +      sources += [
 +        "mac_audio_output_device_sub_menu_model.cc",
@@ -17,13 +18,12 @@ index 0f5a24d..82077ad 100644
 +        "CoreFoundation.framework",
 +      ]
 +    }
-+
+
      # TODO(crbug.com/40031409): Fix code that adds exit-time destructors and
      # enable the diagnostic by removing this line.
-     configs += [ "//build/config/compiler:no_exit_time_destructors" ]
 diff --git a/chrome/browser/ui/tabs/mac_audio_output_device_sub_menu_model.cc b/chrome/browser/ui/tabs/mac_audio_output_device_sub_menu_model.cc
 new file mode 100644
-index 0000000..eb27422
+index 0000000..f2461ed
 --- /dev/null
 +++ b/chrome/browser/ui/tabs/mac_audio_output_device_sub_menu_model.cc
 @@ -0,0 +1,241 @@
@@ -335,18 +335,18 @@ index 0000000..4e67ea3
 +
 +#endif  // CHROME_BROWSER_UI_TABS_MAC_AUDIO_OUTPUT_DEVICE_SUB_MENU_MODEL_H_
 diff --git a/chrome/browser/ui/tabs/tab_menu_model.cc b/chrome/browser/ui/tabs/tab_menu_model.cc
-index fd5792d..0143c4f 100644
+index 1410bc0..0d0e0b7 100644
 --- a/chrome/browser/ui/tabs/tab_menu_model.cc
 +++ b/chrome/browser/ui/tabs/tab_menu_model.cc
 @@ -7,7 +7,6 @@
  #include <memory>
  #include <optional>
- 
+
 -#include "base/command_line.h"
+ #include "base/containers/flat_set.h"
  #include "base/feature_list.h"
  #include "base/functional/bind.h"
- #include "base/i18n/rtl.h"
-@@ -32,6 +31,9 @@
+@@ -34,6 +33,9 @@
  #include "chrome/browser/ui/tabs/existing_window_sub_menu_model.h"
  #include "chrome/browser/ui/tabs/features.h"
  #include "chrome/browser/ui/tabs/glic_tab_sub_menu_model.h"
@@ -355,11 +355,11 @@ index fd5792d..0143c4f 100644
 +#endif
  #include "chrome/browser/ui/tabs/split_tab_menu_model.h"
  #include "chrome/browser/ui/tabs/split_tab_swap_menu_model.h"
- #include "chrome/browser/ui/tabs/tab_group_model.h"
-@@ -167,6 +169,16 @@ void TabMenuModel::BuildLegacySendTabToSelfItem() {
+ #include "chrome/browser/ui/tabs/split_view_layout_menu_model.h"
+@@ -270,6 +272,16 @@
  #endif
  }
- 
+
 +#if BUILDFLAG(IS_MAC)
 +void TabMenuModel::BuildMacAudioOutputDeviceSubmenu(int index) {
 +  mac_audio_output_device_submenu_ =
@@ -370,38 +370,40 @@ index fd5792d..0143c4f 100644
 +}
 +#endif
 +
- void TabMenuModel::Build(int index) {
-   std::vector<int> indices;
-   if (tab_strip_->IsTabSelected(index)) {
-@@ -288,6 +300,11 @@ void TabMenuModel::Build(int index) {
-                     : l10n_util::GetPluralStringFUTF16(
-                           IDS_TAB_CXMENU_SOUND_UNMUTE_SITE, num_tabs));
- 
+ void TabMenuModel::AppendGlicItems(int index,
+                                    int num_tabs,
+                                    const std::vector<int>& indices) {
+@@ -521,6 +533,11 @@
+             ui::kColorMenuIcon, ui::SimpleMenuModel::kDefaultIconSize));
+   }
+
 +#if BUILDFLAG(IS_MAC)
 +  AddSeparator(ui::NORMAL_SEPARATOR);
 +  BuildMacAudioOutputDeviceSubmenu(index);
 +#endif
 +
-   const bool display_read_later = tab_strip_->delegate()->SupportsReadLater();
-   const std::optional<send_tab_to_self::EntryPointDisplayReason>
-       send_tab_to_self_reason = send_tab_to_self::GetEntryPointDisplayReason(
-@@ -444,6 +461,12 @@ bool TabMenuModel::IsEnabledAt(size_t index) const {
-   if (auto* matcher = GetMatcherIfExtension(index)) {
+   const bool show_glic_items =
+       glic::GlicEnabling::IsReadyForProfile(tab_strip_->profile());
+   bool glic_displayed = false;
+@@ -673,6 +690,12 @@
      return matcher->IsCommandIdEnabled(GetCommandIdAt(index));
    }
-+#endif
+ #endif
 +#if BUILDFLAG(IS_MAC)
 +  if (GetCommandIdAt(index) ==
 +      MacAudioOutputDeviceSubMenuModel::kSubMenuCommandId) {
 +    return true;
 +  }
- #endif
++#endif
    return ui::SimpleMenuModel::IsEnabledAt(index);
  }
-@@ -459,6 +482,16 @@ bool TabMenuModel::IsVisibleAt(size_t index) const {
+
+@@ -685,6 +708,16 @@
+   }
+ #endif
    return ui::SimpleMenuModel::IsVisibleAt(index);
- }
- 
++}
++
 +bool TabMenuModel::IsAlertedAt(size_t index) const {
 +#if BUILDFLAG(IS_MAC)
 +  if (GetCommandIdAt(index) ==
@@ -410,27 +412,25 @@ index fd5792d..0143c4f 100644
 +  }
 +#endif
 +  return ui::SimpleMenuModel::IsAlertedAt(index);
-+}
-+
- void TabMenuModel::ActivatedAt(size_t index) {
-   ActivatedAt(index, 0);
  }
+
+ void TabMenuModel::ActivatedAt(size_t index) {
 diff --git a/chrome/browser/ui/tabs/tab_menu_model.h b/chrome/browser/ui/tabs/tab_menu_model.h
-index ef54948..aa751fe 100644
+index 302f4ce..9f920ef 100644
 --- a/chrome/browser/ui/tabs/tab_menu_model.h
 +++ b/chrome/browser/ui/tabs/tab_menu_model.h
 @@ -9,6 +9,7 @@
- 
+
  #include "base/memory/raw_ptr.h"
  #include "base/memory/weak_ptr.h"
 +#include "build/build_config.h"
  #include "extensions/buildflags/buildflags.h"
  #include "ui/base/interaction/element_identifier.h"
  #include "ui/menus/simple_menu_model.h"
-@@ -30,6 +31,10 @@ class TabInterface;
+@@ -30,6 +31,10 @@
  class TabStripModel;
  class TabMenuModelDelegate;
- 
+
 +#if BUILDFLAG(IS_MAC)
 +class MacAudioOutputDeviceSubMenuModel;
 +#endif
@@ -438,7 +438,7 @@ index ef54948..aa751fe 100644
  // A menu model that builds the contents of the tab context menu. To make sure
  // the menu reflects the real state of the tab a new TabMenuModel should be
  // created each time the menu is shown.
-@@ -42,6 +47,7 @@ class TabMenuModelDelegate;
+@@ -42,6 +47,7 @@
  //   ExistingTabGroupSubMenuModel
  //   ExistingWindowSubMenuModel
  //   ExistingComparisonTableSubMenuModel
@@ -446,25 +446,25 @@ index ef54948..aa751fe 100644
  class TabMenuModel : public ui::SimpleMenuModel {
   public:
    DECLARE_CLASS_ELEMENT_IDENTIFIER_VALUE(kAddANoteTabMenuItem);
-@@ -63,6 +69,7 @@ class TabMenuModel : public ui::SimpleMenuModel {
+@@ -64,6 +70,7 @@
    bool IsItemCheckedAt(size_t index) const override;
    bool IsEnabledAt(size_t index) const override;
    bool IsVisibleAt(size_t index) const override;
 +  bool IsAlertedAt(size_t index) const override;
    void ActivatedAt(size_t index) override;
    void ActivatedAt(size_t index, int event_flags) override;
- 
-@@ -71,6 +78,9 @@ class TabMenuModel : public ui::SimpleMenuModel {
+
+@@ -83,6 +90,9 @@
    void BuildForWebApp(int index);
-   void BuildSendTabToSelfSubmenu(int index);
+   void BuildSendTabToSelfSubmenu(int index, const std::vector<int>& indices);
    void BuildLegacySendTabToSelfItem();
 +#if BUILDFLAG(IS_MAC)
 +  void BuildMacAudioOutputDeviceSubmenu(int index);
 +#endif
- 
- #if BUILDFLAG(ENABLE_EXTENSIONS)
-   // Support for appending and executing commands for extension items in the
-@@ -90,6 +100,10 @@ class TabMenuModel : public ui::SimpleMenuModel {
+   void AppendGlicItems(int index,
+                        int num_tabs,
+                        const std::vector<int>& indices);
+@@ -106,6 +116,10 @@
    std::unique_ptr<ui::SimpleMenuModel> send_tab_to_self_submenu_;
    std::unique_ptr<send_tab_to_self::SendTabToSelfContextMenuDelegate>
        send_tab_to_self_submenu_delegate_;
@@ -472,16 +472,16 @@ index ef54948..aa751fe 100644
 +  std::unique_ptr<MacAudioOutputDeviceSubMenuModel>
 +      mac_audio_output_device_submenu_;
 +#endif
- 
+
    // `tab_strip_` needs to outlive this class.
    raw_ptr<TabStripModel> tab_strip_;
 diff --git a/content/browser/renderer_host/media/render_frame_audio_output_stream_factory.cc b/content/browser/renderer_host/media/render_frame_audio_output_stream_factory.cc
-index 416b912..d194caa 100644
+index 0614118..d3d9877 100644
 --- a/content/browser/renderer_host/media/render_frame_audio_output_stream_factory.cc
 +++ b/content/browser/renderer_host/media/render_frame_audio_output_stream_factory.cc
 @@ -13,7 +13,6 @@
  #include <utility>
- 
+
  #include "base/check_op.h"
 -#include "base/command_line.h"
  #include "base/containers/flat_set.h"
@@ -501,9 +501,9 @@ index 416b912..d194caa 100644
  #include "media/base/output_device_info.h"
  #include "media/mojo/mojom/audio_output_stream.mojom.h"
  #include "mojo/public/cpp/bindings/pending_receiver.h"
-@@ -62,16 +63,6 @@ const char* OutputDeviceStatusToString(media::OutputDeviceStatus status) {
+@@ -62,16 +63,6 @@
  }
- 
+
  #if BUILDFLAG(IS_MAC)
 -std::string GetMacAudioOutputDeviceUidSwitchValue() {
 -  const base::CommandLine* command_line =
@@ -518,8 +518,9 @@ index 416b912..d194caa 100644
  bool ContainsOutputDeviceUid(
      const media::AudioDeviceDescriptions& device_descriptions,
      const std::string& device_uid) {
-@@ -369,7 +360,11 @@ void RenderFrameAudioOutputStreamFactory::Core::AuthorizationCompleted(
+@@ -380,8 +371,12 @@
      const std::string& device_id_for_renderer) {
+   CHECK_CURRENTLY_ON(BrowserThread::IO, base::NotFatalUntil::M152);
  #if BUILDFLAG(IS_MAC)
 +  // On macOS a non-empty preferred output device UID sends authorization down
 +  // an async detour (GetDeviceDescriptions -> ...DescriptionsReceived ->
@@ -532,10 +533,10 @@ index 416b912..d194caa 100644
        !preferred_device_uid.empty()) {
      audio_system_->GetDeviceDescriptions(
 diff --git a/content/browser/renderer_host/media/render_frame_audio_output_stream_factory_unittest.cc b/content/browser/renderer_host/media/render_frame_audio_output_stream_factory_unittest.cc
-index 98596bc..5873a9f 100644
+index b0db483..02e6632 100644
 --- a/content/browser/renderer_host/media/render_frame_audio_output_stream_factory_unittest.cc
 +++ b/content/browser/renderer_host/media/render_frame_audio_output_stream_factory_unittest.cc
-@@ -24,7 +24,9 @@
+@@ -23,7 +23,9 @@
  #include "content/browser/renderer_host/media/preferred_audio_output_device_manager.h"
  #include "content/public/browser/browser_task_traits.h"
  #include "content/public/browser/browser_thread.h"
@@ -545,7 +546,7 @@ index 98596bc..5873a9f 100644
  #include "content/public/test/mock_render_process_host.h"
  #include "content/public/test/navigation_simulator.h"
  #include "content/public/test/test_renderer_host.h"
-@@ -33,6 +35,7 @@
+@@ -32,6 +34,7 @@
  #include "media/audio/fake_audio_manager.h"
  #include "media/audio/test_audio_thread.h"
  #include "media/base/audio_parameters.h"
@@ -553,7 +554,7 @@ index 98596bc..5873a9f 100644
  #include "media/base/media_switches.h"
  #include "media/mojo/mojom/audio_output_stream.mojom.h"
  #include "media/mojo/mojom/audio_stream_factory.mojom.h"
-@@ -103,6 +106,10 @@ class RenderFrameAudioOutputStreamFactoryTest
+@@ -102,6 +105,10 @@
    void TearDown() override {
      ForwardingAudioStreamFactory::OverrideAudioStreamFactoryBinderForTesting(
          base::NullCallback());
@@ -564,11 +565,10 @@ index 98596bc..5873a9f 100644
      audio_manager_.Shutdown();
      RenderViewHostTestHarness::TearDown();
    }
-@@ -277,6 +284,29 @@ TEST_F(RenderFrameAudioOutputStreamFactoryTest,
- }
- 
+@@ -277,6 +284,29 @@
+
  #if BUILDFLAG(IS_MAC)
-+TEST_F(RenderFrameAudioOutputStreamFactoryTest,
+ TEST_F(RenderFrameAudioOutputStreamFactoryTest,
 +       MacAudioOutputDeviceUidPerTabSelectionDoesNotAffectOtherTabs) {
 +  std::unique_ptr<WebContents> other_contents = CreateTestWebContents();
 +  RenderFrameHostTester::For(other_contents->GetPrimaryMainFrame())
@@ -591,12 +591,42 @@ index 98596bc..5873a9f 100644
 +                  .empty());
 +}
 +
- TEST_F(RenderFrameAudioOutputStreamFactoryTest,
++TEST_F(RenderFrameAudioOutputStreamFactoryTest,
         MacAudioOutputDeviceUidSwitchOverridesStreamDeviceWhenValid) {
    base::test::ScopedCommandLine scoped_command_line;
-@@ -345,5 +375,128 @@ TEST_F(RenderFrameAudioOutputStreamFactoryTest,
-             audio_service_stream_factory_.last_output_device_id());
- }
+   scoped_command_line.GetProcessCommandLine()->AppendSwitchUTF8(
+@@ -315,6 +345,129 @@
+   base::test::ScopedCommandLine scoped_command_line;
+   scoped_command_line.GetProcessCommandLine()->AppendSwitchUTF8(
+       switches::kMacAudioOutputDeviceUid, kUnavailableOutputDeviceUid);
++
++  mojo::Remote<blink::mojom::RendererAudioOutputStreamFactory> factory_remote;
++  RenderFrameAudioOutputStreamFactory factory(
++      main_rfh(), audio_system_.get(), media_stream_manager_.get(),
++      factory_remote.BindNewPipeAndPassReceiver());
++
++  mojo::Remote<media::mojom::AudioOutputStreamProvider> provider_remote;
++  MockAuthorizationCallback mock_callback;
++  factory_remote->RequestDeviceAuthorization(
++      provider_remote.BindNewPipeAndPassReceiver(), std::nullopt,
++      kDefaultDeviceId, mock_callback.Get());
++
++  EXPECT_CALL(mock_callback,
++              Run(media::OUTPUT_DEVICE_STATUS_OK, _, std::string()));
++
++  base::RunLoop().RunUntilIdle();
++  ASSERT_EQ(1u, factory.CurrentNumberOfProvidersForTesting());
++
++  mojo::PendingRemote<media::mojom::AudioOutputStreamProviderClient> client;
++  std::ignore = client.InitWithNewPipeAndPassReceiver();
++  provider_remote->Acquire(kParams, std::move(client));
++
++  base::RunLoop().RunUntilIdle();
++
++  EXPECT_TRUE(!!audio_service_stream_factory_.last_created_callback());
++  EXPECT_EQ(kDefaultDeviceId,
++            audio_service_stream_factory_.last_output_device_id());
++}
 +
 +TEST_F(RenderFrameAudioOutputStreamFactoryTest,
 +       MacAudioOutputDeviceUidPerTabSelectionOverridesSwitchForStream) {
@@ -692,45 +722,17 @@ index 98596bc..5873a9f 100644
 +  scoped_command_line.GetProcessCommandLine()->AppendSwitchUTF8(
 +      switches::kMacAudioOutputDeviceUid, kPreferredOutputDeviceUid);
 +  media::SetMacAudioOutputDeviceUid(std::string());
-+
-+  mojo::Remote<blink::mojom::RendererAudioOutputStreamFactory> factory_remote;
-+  RenderFrameAudioOutputStreamFactory factory(
-+      main_rfh(), audio_system_.get(), media_stream_manager_.get(),
-+      factory_remote.BindNewPipeAndPassReceiver());
-+
-+  mojo::Remote<media::mojom::AudioOutputStreamProvider> provider_remote;
-+  MockAuthorizationCallback mock_callback;
-+  factory_remote->RequestDeviceAuthorization(
-+      provider_remote.BindNewPipeAndPassReceiver(), std::nullopt,
-+      kDefaultDeviceId, mock_callback.Get());
-+
-+  EXPECT_CALL(mock_callback,
-+              Run(media::OUTPUT_DEVICE_STATUS_OK, _, std::string()));
-+
-+  base::RunLoop().RunUntilIdle();
-+  ASSERT_EQ(1u, factory.CurrentNumberOfProvidersForTesting());
-+
-+  mojo::PendingRemote<media::mojom::AudioOutputStreamProviderClient> client;
-+  std::ignore = client.InitWithNewPipeAndPassReceiver();
-+  provider_remote->Acquire(kParams, std::move(client));
-+
-+  base::RunLoop().RunUntilIdle();
-+
-+  EXPECT_TRUE(!!audio_service_stream_factory_.last_created_callback());
-+  EXPECT_EQ(kDefaultDeviceId,
-+            audio_service_stream_factory_.last_output_device_id());
-+}
- #endif  // BUILDFLAG(IS_MAC)
- 
- TEST_F(RenderFrameAudioOutputStreamFactoryTest,
+
+   mojo::Remote<blink::mojom::RendererAudioOutputStreamFactory> factory_remote;
+   RenderFrameAudioOutputStreamFactory factory(
 diff --git a/content/public/browser/BUILD.gn b/content/public/browser/BUILD.gn
-index 344cddd..6739422 100644
+index 86a0536..4b7e540 100644
 --- a/content/public/browser/BUILD.gn
 +++ b/content/public/browser/BUILD.gn
-@@ -566,6 +566,13 @@ source_set("browser_sources") {
+@@ -573,6 +573,13 @@
      ]
    }
- 
+
 +  if (is_mac) {
 +    sources += [
 +      "mac_audio_output_device.cc",
@@ -743,7 +745,7 @@ index 344cddd..6739422 100644
          [ "//third_party/webrtc/modules/desktop_capture:pipewire_config" ]
 diff --git a/content/public/browser/mac_audio_output_device.cc b/content/public/browser/mac_audio_output_device.cc
 new file mode 100644
-index 0000000..4c73f3f
+index 0000000..b5d91ff
 --- /dev/null
 +++ b/content/public/browser/mac_audio_output_device.cc
 @@ -0,0 +1,207 @@
@@ -1009,12 +1011,12 @@ index 0000000..580701a
 +
 +#endif  // CONTENT_PUBLIC_BROWSER_MAC_AUDIO_OUTPUT_DEVICE_H_
 diff --git a/media/base/BUILD.gn b/media/base/BUILD.gn
-index 82ef507..72fb588 100644
+index 3a1e7f5..a638e43 100644
 --- a/media/base/BUILD.gn
 +++ b/media/base/BUILD.gn
-@@ -467,6 +467,11 @@ source_set("base") {
+@@ -469,6 +469,11 @@
    }
- 
+
    if (is_mac) {
 +    sources += [
 +      "mac_audio_output_device_uid.cc",

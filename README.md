@@ -25,7 +25,7 @@ Conductor exists solely because I wanted the browser itself to have its own nati
 
 ## Custom Changes
 
-This build currently includes two local patches.
+This build currently includes four local patches.
 
 ### mac-audio-output-device-uid-switch.patch
 
@@ -38,6 +38,18 @@ This allows the browser to target a chosen audio device instead of relying entir
 Adds a macOS-only **Send Audio To** submenu to the tab context menu.
 
 Audio output can be assigned on a per-tab basis, and switched between available output devices.
+
+### mac-toolchain-compatibility.patch
+
+Keeps Chromium's SDK version and build metadata aligned with the SDK selected by
+Conductor, and lets bindgen find its bundled `libclang` library.
+
+### mac-devtools-local-tools.patch
+
+Uses the checkout's TypeScript compiler with bundled Node and a matching local
+esbuild binary for DevTools. Conductor downloads the versioned macOS esbuild
+package from the npm registry, verifies its package integrity, and caches it
+under `out/devtools-tools/` for later rebuilds.
 
 ## Build Configuration
 
@@ -70,6 +82,7 @@ The script handles:
 - build verification
 - clean rebuilds
 - update rebuilds
+- disk image packaging
 - safety checks
 
 My goal is to make Chromium builds predictable, repeatable, and easy to recover if something goes wrong.
@@ -82,6 +95,7 @@ My goal is to make Chromium builds predictable, repeatable, and easy to recover 
 | `flags.macos.gn` | Apple silicon build configuration |
 | `patches.local/` | Local Chromium Conductor patches |
 | `conductor.conf` | Local build configuration |
+| `tools/` | SDK selection, DevTools restoration, and disk image packaging helpers |
 
 ## Prerequisites
 
@@ -147,6 +161,39 @@ Chromium Conductor uses `greadlink`; it is provided by GNU Coreutils.
 brew install coreutils
 ```
 
+#### 5. Set Up Python and Go
+
+Conductor follows upstream's source clone workflow. The clone tooling requires
+Python 3.10 through 3.13, plus `httplib2`, `six`, and `PySocks`. Go is also needed
+by the macOS resource helper.
+
+After cloning this project, run these commands from its directory:
+
+```bash
+brew install python@3.13 go
+"$(brew --prefix python@3.13)/bin/python3.13" -m venv out/python-venv
+out/python-venv/bin/python -m pip install httplib2 six PySocks
+source out/python-venv/bin/activate
+```
+
+Activate that environment again in each new terminal before running a build.
+It lives outside the generated checkout, so full rebuilds preserve it.
+Conductor checks these requirements before deleting generated state.
+
+### macOS SDK Compatibility
+
+After restoring the build tools, Conductor tests the downloaded LLVM linker with
+the active macOS SDK. If they are incompatible, it checks other installed SDKs,
+preferring the SDK version specified by the Chromium release. The selected SDK
+is used by both bindgen and Chromium, preserving the configured LLVM and ThinLTO
+settings. This handles Xcode 27 SDKs that older LLVM linkers cannot parse.
+Chromium accesses that SDK through a link inside its build output directory,
+as required by GN's SDK input rules.
+
+To select a specific installed SDK, set `SDKROOT` to its full path before running
+Conductor. An explicit selection must pass the compatibility check. Conductor
+does not change the system's Xcode selection or modify installed SDKs.
+
 ### Verify Your Environment
 
 The following commands should all succeed:
@@ -156,6 +203,8 @@ xcode-select -p
 brew --version
 git --version
 python3 --version
+python3 -c 'import httplib2, six, socks'
+go version
 greadlink --version
 ```
 
@@ -166,7 +215,8 @@ Expected sources:
 | xcode-select | Xcode Command Line Tools |
 | brew | Homebrew |
 | git | Xcode Command Line Tools |
-| python3 | macOS / Chromium tooling environment |
+| python3 | Python 3.13 build environment |
+| go | Homebrew |
 | greadlink | GNU Coreutils |
 
 If any command fails, resolve the missing dependency before continuing.
@@ -204,7 +254,7 @@ cd Chromium-Conductor
 
 ## Building
 
-The initial build downloads Chromium source, toolchains, build dependencies, applies patches, generates build files, and compiles the browser.
+The initial build clones the selected Chromium source release, downloads toolchains and build dependencies, applies patches, generates build files, and compiles the browser. It uses upstream's clone workflow because a source archive may be unavailable for the selected release.
 
 A clean build can take several hours. If this is your first build, plan accordingly.
 
@@ -267,6 +317,40 @@ Show usage and all available commands:
 ```bash
 ./conductor.sh --help
 ```
+
+## Packaging a GitHub Release
+
+Package your completed build without rebuilding or downloading anything:
+
+```bash
+./conductor.sh --package
+```
+
+Conductor creates a compressed, read-only disk image containing `Chromium.app`
+and an **Applications** shortcut for drag-and-drop installation. It checks the
+image's integrity, mounts it read-only to compare the packaged app with the
+original, and writes a SHA-256 checksum. The release tag comes from the last
+successful build record, and the architecture comes from the app executable.
+Packaging refuses a version mismatch or existing output files.
+
+For example, an ARM64 build of release `154.0.8037.57-1.1` produces:
+
+```text
+out/releases/Chromium-Conductor_154.0.8037.57-1.1_macos-arm64.dmg
+out/releases/Chromium-Conductor_154.0.8037.57-1.1_macos-arm64.dmg.sha256
+```
+
+Attach both files to a release in
+[Chromium-Conductor on GitHub](https://github.com/works-by-maya/Chromium-Conductor/releases).
+They are generated assets and remain outside Git. To package the same version
+again, move the existing image and checksum out of `out/releases/` first.
+ChromeDriver remains a separate build output and is not included in the image.
+
+Packaging preserves the app's existing signing and does not sign, notarize, or
+upload it. A locally built app without Developer ID signing and notarization
+may trigger Gatekeeper when someone downloads it. For Developer ID distribution,
+use the existing signing configuration when building; see
+[Apple's distribution guidance](https://developer.apple.com/developer-id/).
 
 ## Status
 

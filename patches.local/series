@@ -4,3 +4,5 @@
 # skip-a-feature-we-are-not-building.patch # short inline hint for humans
 mac-audio-output-device-uid-switch.patch # add macOS audio output UID switch
 mac-audio-output-device-tab-menu.patch # add macOS tab audio output menu
+mac-toolchain-compatibility.patch # use selected SDK metadata and locate bindgen's libclang
+mac-devtools-local-tools.patch # use project-local TypeScript and esbuild tools

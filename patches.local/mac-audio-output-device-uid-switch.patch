@@ -2,7 +2,7 @@
 +++ b/content/browser/renderer_host/media/render_frame_audio_output_stream_factory.cc
 @@ -13,6 +13,7 @@
  #include <utility>
- 
+
  #include "base/check_op.h"
 +#include "base/command_line.h"
  #include "base/containers/flat_set.h"
@@ -25,10 +25,11 @@
  #include "media/base/output_device_info.h"
  #include "media/mojo/mojom/audio_output_stream.mojom.h"
  #include "mojo/public/cpp/bindings/pending_receiver.h"
-@@ -56,6 +61,29 @@
+@@ -55,6 +60,29 @@
+       return "ERROR_INTERNAL";
    }
  }
- 
++
 +#if BUILDFLAG(IS_MAC)
 +std::string GetMacAudioOutputDeviceUidSwitchValue() {
 +  const base::CommandLine* command_line =
@@ -51,22 +52,13 @@
 +  return false;
 +}
 +#endif  // BUILDFLAG(IS_MAC)
-+
+
  }  // namespace
- 
- class RenderFrameAudioOutputStreamFactory::Core final
-@@ -156,9 +184,40 @@
-   // requested a device using a |session_id|, to let it know which device was
-   // chosen. This id is hashed.
-   void AuthorizationCompleted(
-+      base::TimeTicks auth_start_time,
-+      mojo::PendingReceiver<media::mojom::AudioOutputStreamProvider> receiver,
-+      RequestDeviceAuthorizationCallback callback,
-+      media::OutputDeviceStatus status,
-+      const media::AudioParameters& params,
-+      const std::string& raw_device_id,
-+      const std::string& device_id_for_renderer);
-+
+
+@@ -164,6 +192,37 @@
+       const std::string& raw_device_id,
+       const std::string& device_id_for_renderer);
+
 +#if BUILDFLAG(IS_MAC)
 +  void MacAudioOutputDeviceDescriptionsReceived(
 +      base::TimeTicks auth_start_time,
@@ -79,9 +71,9 @@
 +      media::AudioDeviceDescriptions device_descriptions);
 +
 +  void MacAudioOutputDeviceParametersReceived(
-       base::TimeTicks auth_start_time,
-       mojo::PendingReceiver<media::mojom::AudioOutputStreamProvider> receiver,
-       RequestDeviceAuthorizationCallback callback,
++      base::TimeTicks auth_start_time,
++      mojo::PendingReceiver<media::mojom::AudioOutputStreamProvider> receiver,
++      RequestDeviceAuthorizationCallback callback,
 +      const media::AudioParameters& original_params,
 +      const std::string& original_raw_device_id,
 +      const std::string& device_id_for_renderer,
@@ -93,29 +85,42 @@
 +      base::TimeTicks auth_start_time,
 +      mojo::PendingReceiver<media::mojom::AudioOutputStreamProvider> receiver,
 +      RequestDeviceAuthorizationCallback callback,
-       media::OutputDeviceStatus status,
-       const media::AudioParameters& params,
-       const std::string& raw_device_id,
++      media::OutputDeviceStatus status,
++      const media::AudioParameters& params,
++      const std::string& raw_device_id,
++      const std::string& device_id_for_renderer);
++
+   void DeleteProvider(media::mojom::AudioOutputStreamProvider* stream_provider);
+
+   // Helper method for storing native logs.
 @@ -172,6 +231,7 @@
    const int process_id_;
    const GlobalRenderFrameHostId global_render_frame_host_id_;
    const GlobalRenderFrameHostToken main_frame_token_;
 +  const raw_ptr<media::AudioSystem> audio_system_;
    AudioOutputAuthorizationHandler authorization_handler_;
- 
+
    mojo::Receiver<blink::mojom::RendererAudioOutputStreamFactory> receiver_{
-@@ -233,6 +293,7 @@
+@@ -242,6 +302,7 @@
      : process_id_(frame->GetProcess()->GetDeprecatedID()),
        global_render_frame_host_id_(frame->GetGlobalId()),
        main_frame_token_(frame->GetMainFrame()->GetGlobalFrameToken()),
 +      audio_system_(audio_system),
-       authorization_handler_(audio_system, media_stream_manager, process_id_) {
-   DCHECK_CURRENTLY_ON(BrowserThread::UI);
- 
-@@ -306,7 +367,107 @@
-     const media::AudioParameters& params,
-     const std::string& raw_device_id,
-     const std::string& device_id_for_renderer) {
+       authorization_handler_(audio_system,
+                              media_stream_manager,
+                              global_render_frame_host_id_) {
+@@ -310,6 +371,107 @@
+ }
+
+ void RenderFrameAudioOutputStreamFactory::Core::AuthorizationCompleted(
++    base::TimeTicks auth_start_time,
++    mojo::PendingReceiver<media::mojom::AudioOutputStreamProvider> receiver,
++    RequestDeviceAuthorizationCallback callback,
++    media::OutputDeviceStatus status,
++    const media::AudioParameters& params,
++    const std::string& raw_device_id,
++    const std::string& device_id_for_renderer) {
++  CHECK_CURRENTLY_ON(BrowserThread::IO, base::NotFatalUntil::M152);
 +#if BUILDFLAG(IS_MAC)
 +  const std::string preferred_device_uid =
 +      GetMacAudioOutputDeviceUidSwitchValue();
@@ -148,7 +153,7 @@
 +        const std::string& device_id_for_renderer,
 +        const std::string& preferred_device_uid,
 +        media::AudioDeviceDescriptions device_descriptions) {
-   DCHECK_CURRENTLY_ON(BrowserThread::IO);
++  DCHECK_CURRENTLY_ON(BrowserThread::IO);
 +
 +  if (!ContainsOutputDeviceUid(device_descriptions, preferred_device_uid)) {
 +    SendLogMessage(base::StringPrintf(
@@ -209,17 +214,9 @@
 +#endif  // BUILDFLAG(IS_MAC)
 +
 +void RenderFrameAudioOutputStreamFactory::Core::FinishAuthorization(
-+    base::TimeTicks auth_start_time,
-+    mojo::PendingReceiver<media::mojom::AudioOutputStreamProvider> receiver,
-+    RequestDeviceAuthorizationCallback callback,
-+    media::OutputDeviceStatus status,
-+    const media::AudioParameters& params,
-+    const std::string& raw_device_id,
-+    const std::string& device_id_for_renderer) {
-+  DCHECK_CURRENTLY_ON(BrowserThread::IO);
-   TRACE_EVENT2("audio",
-                "RenderFrameAudioOutputStreamFactory::AuthorizationCompleted",
-                "raw device id", raw_device_id, "status", status);
+     base::TimeTicks auth_start_time,
+     mojo::PendingReceiver<media::mojom::AudioOutputStreamProvider> receiver,
+     RequestDeviceAuthorizationCallback callback,
 --- a/content/browser/renderer_host/media/render_frame_audio_output_stream_factory_unittest.cc
 +++ b/content/browser/renderer_host/media/render_frame_audio_output_stream_factory_unittest.cc
 @@ -13,8 +13,10 @@
@@ -241,11 +238,10 @@
  #include "media/mojo/mojom/audio_output_stream.mojom.h"
  #include "media/mojo/mojom/audio_stream_factory.mojom.h"
  #include "mojo/public/cpp/bindings/pending_associated_remote.h"
-@@ -47,6 +50,29 @@
- using ::testing::StrictMock;
- 
+@@ -48,6 +51,29 @@
+
  namespace content {
-+
+
 +namespace {
 +
 +constexpr char kPreferredOutputDeviceUid[] = "preferred-output-device-uid";
@@ -268,9 +264,10 @@
 +};
 +
 +}  // namespace
- 
++
  class RenderFrameAudioOutputStreamFactoryTest
      : public RenderViewHostTestHarness {
+  public:
 @@ -99,6 +125,7 @@
          const media::AudioParameters& params,
          const base::UnguessableToken& group_id,
@@ -278,7 +275,7 @@
 +      last_output_device_id_ = output_device_id;
        last_created_callback_ = std::move(created_callback);
      }
- 
+
 @@ -113,6 +140,7 @@
          const media::AudioParameters& params,
          const base::UnguessableToken& group_id,
@@ -286,11 +283,11 @@
 +      last_output_device_id_ = device_id;
        last_created_callback_ = std::move(created_callback);
      }
- 
+
 @@ -120,7 +148,12 @@
        return !last_created_callback_.is_null();
      }
- 
+
 +    const std::string& last_output_device_id() const {
 +      return last_output_device_id_;
 +    }
@@ -299,7 +296,7 @@
 +    std::string last_output_device_id_;
      CreateOutputStreamCallback last_created_callback_;
    };
- 
+
 @@ -136,7 +169,7 @@
        media::AudioParameters::UnavailableDeviceParams();
    MockStreamFactory audio_service_stream_factory_;
@@ -309,12 +306,13 @@
    std::unique_ptr<media::AudioSystem> audio_system_;
    std::unique_ptr<MediaStreamManager> media_stream_manager_;
  };
-@@ -242,7 +275,77 @@
+@@ -241,6 +274,76 @@
+   EXPECT_TRUE(!!audio_service_stream_factory_.last_created_callback());
    EXPECT_EQ(0u, factory.CurrentNumberOfProvidersForTesting());
  }
- 
++
 +#if BUILDFLAG(IS_MAC)
- TEST_F(RenderFrameAudioOutputStreamFactoryTest,
++TEST_F(RenderFrameAudioOutputStreamFactoryTest,
 +       MacAudioOutputDeviceUidSwitchOverridesStreamDeviceWhenValid) {
 +  base::test::ScopedCommandLine scoped_command_line;
 +  scoped_command_line.GetProcessCommandLine()->AppendSwitchUTF8(
@@ -382,28 +380,26 @@
 +            audio_service_stream_factory_.last_output_device_id());
 +}
 +#endif  // BUILDFLAG(IS_MAC)
-+
-+TEST_F(RenderFrameAudioOutputStreamFactoryTest,
+
+ TEST_F(RenderFrameAudioOutputStreamFactoryTest,
         CreateStreamAfterFactoryDestruction_Fails) {
-   mojo::Remote<media::mojom::AudioOutputStreamProvider> provider_remote;
-   MockAuthorizationCallback mock_callback;
 --- a/media/base/media_switches.cc
 +++ b/media/base/media_switches.cc
-@@ -147,6 +147,11 @@
+@@ -171,6 +171,11 @@
+ // Force media player using SurfaceView instead of SurfaceTexture on Android.
  // Note: This is used by the Cast playback pipeline and must be kept.
  const char kForceVideoOverlays[] = "force-video-overlays";
- 
++
 +#if BUILDFLAG(IS_MAC)
 +// Routes browser audio output to the CoreAudio output device with this UID.
 +const char kMacAudioOutputDeviceUid[] = "mac-audio-output-device-uid";
 +#endif
-+
+
  // Allows explicitly specifying MSE audio/video buffer sizes as megabytes.
  // Default values are 150M for video and 12M for audio.
- const char kMSEAudioBufferSizeLimitMb[] = "mse-audio-buffer-size-limit-mb";
 --- a/media/base/media_switches.h
 +++ b/media/base/media_switches.h
-@@ -58,6 +58,9 @@
+@@ -62,6 +62,9 @@
  MEDIA_EXPORT extern const char kFailAudioStreamCreation[];
  MEDIA_EXPORT extern const char kFakeBackgroundBlurTogglePeriod[];
  MEDIA_EXPORT extern const char kForceVideoOverlays[];

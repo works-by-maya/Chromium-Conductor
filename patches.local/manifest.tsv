@@ -3,3 +3,5 @@
 # skip-a-feature-we-are-not-building.patch	Skip feature we are not building	This local build keeps that feature out so the browser stays aligned with the workspace's goals.
 mac-audio-output-device-uid-switch.patch	Add macOS audio output UID switch	Allows this Chromium build to route browser audio to a selected CoreAudio output device while falling back to the normal authorized/default device when unavailable.
 mac-audio-output-device-tab-menu.patch	Add macOS tab audio output menu	Adds a macOS-only Send Audio To submenu to the tab context menu, enumerates CoreAudio output devices at runtime, stores explicit selections per WebContents, and asks the selected tab's media session to switch active media output.
+mac-toolchain-compatibility.patch	Use compatible macOS toolchain settings	Reports the selected SDK's version and build and lets bindgen find libclang in the installed Rust toolchain.
+mac-devtools-local-tools.patch	Use local DevTools build tools	Uses the checkout's TypeScript compiler with bundled Node and restores the matching esbuild binary instead of requiring hard-coded Homebrew executables.

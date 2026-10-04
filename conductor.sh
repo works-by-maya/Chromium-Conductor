@@ -42,6 +42,9 @@
 # ./conductor.sh --update-build
 #   Time saver: Refresh what's changed, reapply patches, and rebuild.
 #
+# ./conductor.sh --package
+#   Make a disk image and SHA-256 checksum from the completed app.
+#
 # ./conductor.sh --help
 #   Show this information.
 #
@@ -54,6 +57,7 @@
 #   conductor.conf
 #   flags.macos.gn
 #   patches.local/
+#   tools/
 #
 # If these files change, Chromium Conductor changes.
 #
@@ -74,7 +78,9 @@
 # Full rebuilds start from a fresh upstream release.
 #
 # update-build keeps what is safe to keep, updates what needs refreshing,
-# reapplies patches, and rebuilds.
+# reapplies patches, and rebuilds. Build output is reused only when the selected
+# release matches the last successful build; freshly retrieved source alone
+# does not guarantee every stale Ninja output is invalidated across releases.
 #
 # Do not patch over an already-patched tree.
 # Refresh generated source first, then apply patches cleanly.
@@ -150,7 +156,8 @@ SOURCE_STATE_FILE="${BUILD_DIR}/.conductor-source-state"
 # fallback when the new marker is absent.
 LEGACY_SOURCE_STATE_FILE="${BUILD_DIR}/.forge-source-state"
 
-RETRIEVE_SCRIPT="${REPO_DIR}/retrieve_and_unpack_resource.sh"
+RETRIEVE_SCRIPT=""
+BUILD_SDK_PATH=""
 SIGN_SCRIPT="${REPO_DIR}/sign_and_package_app.sh"
 
 UNGOOGLED_RELEASES_API="https://api.github.com/repos/ungoogled-software/ungoogled-chromium-macos/releases/latest"
@@ -251,6 +258,9 @@ mode_description() {
         update-build)
             echo "update-build: refresh, patch, rebuild"
             ;;
+        package)
+            echo "package: create a disk image from the completed app"
+            ;;
         *)
             echo "unknown"
             ;;
@@ -309,6 +319,11 @@ How to run it:
 ./conductor.sh --update-build
   Time saver: Refresh what's changed, reapply patches, and rebuild.
 
+./conductor.sh --package
+  Package the completed app as a compressed disk image with an Applications
+  shortcut and SHA-256 checksum under out/releases/. Preserves app signing.
+  No checkout changes, rebuilding, signing, notarization, or uploads.
+
 ./conductor.sh --help
   Show this information.
 
@@ -318,6 +333,7 @@ These files are the project:
   conductor.conf
   flags.macos.gn
   patches.local/
+  tools/
 
 If these files change, Chromium Conductor changes.
 
@@ -420,6 +436,15 @@ parse_args() {
                     exit 1
                 }
                 MODE="update-build"
+                shift
+                ;;
+            --package)
+                [[ "${MODE}" == "full" ]] || {
+                    echo "Only one mode can be selected." >&2
+                    echo "Run ./conductor.sh --help for usage." >&2
+                    exit 1
+                }
+                MODE="package"
                 shift
                 ;;
             *)
@@ -525,6 +550,12 @@ validate_host_layout() {
     section "checking local files"
     explain "make sure the machine and project files are ready before anything changes"
 
+    if [[ "${MODE}" == "package" ]]; then
+        require_command python3
+        require_file "${SCRIPT_DIR}/tools/package_macos.py"
+        return
+    fi
+
     # Check tools and authored project files before touching generated state.
     # If something is missing, stop early and say so plainly.
     require_command curl
@@ -542,10 +573,65 @@ validate_host_layout() {
     require_file "${LOCAL_PATCHES_SERIES}"
     require_file "${LOCAL_PATCHES_MANIFEST}"
 
+    if [[ "${MODE}" == "full" || "${MODE}" == "update-build" ]]; then
+        require_file "${SCRIPT_DIR}/tools/select_macos_sdk.py"
+        require_file "${SCRIPT_DIR}/tools/prepare_devtools_tools.py"
+        validate_source_clone_environment
+    fi
+
     info "Script directory: ${SCRIPT_DIR}"
     info "Config file: ${CONF_FILE}"
     info "Build flags: ${FLAGS_MACOS}"
     info "Local patches: ${LOCAL_PATCHES_DIR}"
+}
+
+validate_source_clone_environment() {
+    # Check clone-tool prerequisites before a build deletes generated state.
+    # Upstream depot_tools supports Python 3.13 or earlier; clone.py requires
+    # Python 3.10 or newer plus these Python modules.
+    local python_status
+    if ! python_status="$(python3 - <<'PY'
+import importlib.util
+import sys
+
+version = '.'.join(map(str, sys.version_info[:3]))
+if not (3, 10) <= sys.version_info[:2] < (3, 14):
+    print(f'Source cloning requires Python 3.10 through 3.13; python3 is {version}. '
+          'Set up the Python 3.13 build environment described in README.md before rebuilding.')
+    sys.exit(1)
+
+missing = [name for name in ('httplib2', 'six', 'socks')
+           if importlib.util.find_spec(name) is None]
+if missing:
+    print('Source cloning is missing Python modules: ' + ', '.join(missing) + '. '
+          'Install httplib2, six, and PySocks in the build environment described in README.md.')
+    sys.exit(1)
+
+print(f'Source retrieval Python: {version} (httplib2, six, and PySocks available)')
+PY
+    )"; then
+        error "${python_status}"
+    fi
+    info "${python_status}"
+    require_command go
+}
+
+select_retrieve_script() {
+    # Upstream replaced the shell helper with Python. Older release tags still
+    # use the shell helper, so resolve this from the checkout being validated.
+    # Both helpers accept the same -d, -g, -p, and target CPU arguments.
+    local python_helper="${REPO_DIR}/retrieve_and_unpack_resource.py"
+    local shell_helper="${REPO_DIR}/retrieve_and_unpack_resource.sh"
+
+    if [[ -f "${python_helper}" ]]; then
+        RETRIEVE_SCRIPT="${python_helper}"
+    elif [[ -f "${shell_helper}" ]]; then
+        RETRIEVE_SCRIPT="${shell_helper}"
+    else
+        error "Required resource helper is missing: expected ${python_helper} or ${shell_helper}"
+    fi
+
+    require_executable "${RETRIEVE_SCRIPT}"
 }
 
 validate_repo_layout() {
@@ -556,7 +642,7 @@ validate_repo_layout() {
     # upstream layout changes near the top of the log instead of hiding them
     # halfway through source retrieval or patching.
     require_dir "${REPO_DIR}"
-    require_executable "${RETRIEVE_SCRIPT}"
+    select_retrieve_script
 
     is_git_worktree "${REPO_DIR}" || error "Expected a git checkout at ${REPO_DIR}"
 
@@ -805,7 +891,7 @@ validate_existing_update_checkout() {
         error "No existing checkout found. Run ./conductor.sh for a full clean rebuild first."
     fi
 
-    require_executable "${RETRIEVE_SCRIPT}"
+    select_retrieve_script
     is_git_worktree "${REPO_DIR}" || error "Expected a git checkout at ${REPO_DIR}"
     is_git_worktree "${MAIN_REPO}" || error "Expected a git checkout at ${MAIN_REPO}"
     require_file "${SRC_DIR}/DEPS"
@@ -824,8 +910,7 @@ check_update_dirty_state() {
     ensure_git_tree_clean "${MAIN_REPO}" "ungoogled Chromium files"
 
     if [[ -d "${SRC_DIR}" ]]; then
-        info "Generated Chromium source is archive-unpacked, not its own Git checkout."
-        info "update-build will refresh ${SRC_DIR} from the clean source archive before patching."
+        info "update-build will replace ${SRC_DIR} with fresh source from the selected release before patching."
         info "Build cache at ${SRC_DIR}/out will be kept when possible."
     fi
 }
@@ -1154,6 +1239,9 @@ validate_post_checkout_layout() {
     section "checking release files"
     explain "stop early if the pinned release is missing files needed for patches or flags"
 
+    # Checking out a release can switch between the Python and shell helpers.
+    select_retrieve_script
+
     # These files are the contract between the macOS wrapper and the shared
     # ungoogled-chromium repo. If any are absent after checkout/submodule init,
     # building would fail later with a worse error, so stop here.
@@ -1164,6 +1252,7 @@ validate_post_checkout_layout() {
     require_file "${MAIN_REPO}/domain_regex.list"
     require_file "${MAIN_REPO}/domain_substitution.list"
     require_file "${MAIN_REPO}/utils/prune_binaries.py"
+    require_file "${MAIN_REPO}/utils/clone.py"
     require_file "${MAIN_REPO}/utils/patches.py"
     require_file "${MAIN_REPO}/utils/domain_substitution.py"
 
@@ -1234,21 +1323,19 @@ delete_build_state() {
 
 retrieve_sources_and_resources() {
     section "restoring Chromium source"
-    explain "download the known Chromium source archive instead of using the heavier gclient path"
+    explain "clone the selected Chromium release and retrieve its dependencies using the upstream helper"
 
-    # Use the upstream helper's download mode (-d). Without -d, the helper takes
-    # the git/gclient clone path, which has many more moving pieces for this
-    # workflow and has broken before on Chromium DEPS/CIPD schema drift. The
-    # archive path is the steady path: fetch the known Chromium release archive,
-    # unpack it, then layer the macOS-specific shared resources on top.
+    # Follow upstream's default clone path. The optional -d archive path can
+    # return 404 even when the selected release and its Chromium Git tag exist.
+    # clone.py pins Chromium and depot_tools to the release's matching revisions.
     mkdir -p "${BUILD_DIR}"
     mkdir -p "${DOWNLOAD_CACHE}"
     mkdir -p "${SRC_DIR}"
 
     cd "${REPO_DIR}"
 
-    info "Retrieving Chromium source archive for ${ARCH_GN}"
-    "${RETRIEVE_SCRIPT}" -d -g "${ARCH_RESOURCE}"
+    info "Retrieving Chromium ${LATEST_VERSION} source for ${ARCH_GN}"
+    "${RETRIEVE_SCRIPT}" -g "${ARCH_RESOURCE}"
 
     require_dir "${SRC_DIR}"
     require_dir "${DOWNLOAD_CACHE}"
@@ -1288,11 +1375,24 @@ reset_generated_source_for_update() {
     fi
 
     local preserved_out=0
+    local last_built_tag=""
+    if [[ -s "${LAST_BUILT_VERSION_FILE}" ]]; then
+        last_built_tag="$(tr -d '[:space:]' < "${LAST_BUILT_VERSION_FILE}")"
+    fi
+
     if [[ -d "${SRC_DIR}/out" ]]; then
-        mkdir -p "${UPDATE_BUILD_STASH_DIR}"
-        info "Keeping build output cache: ${SRC_DIR}/out"
-        mv "${SRC_DIR}/out" "${UPDATE_OUT_STASH}"
-        preserved_out=1
+        if [[ -n "${last_built_tag}" && "${last_built_tag}" == "${LATEST_TAG}" ]]; then
+            mkdir -p "${UPDATE_BUILD_STASH_DIR}"
+            info "Keeping same-release build output cache: ${SRC_DIR}/out"
+            info "Cached build release: ${last_built_tag}"
+            mv "${SRC_DIR}/out" "${UPDATE_OUT_STASH}"
+            preserved_out=1
+        else
+            info "Not reusing build output cache across releases."
+            info "Cached build release: ${last_built_tag:-<unknown>}"
+            info "Selected release:     ${LATEST_TAG:-<unknown>}"
+            explain "freshly retrieved source cannot safely invalidate every stale Ninja output across releases"
+        fi
     else
         info "No build output cache to keep at ${SRC_DIR}/out"
     fi
@@ -1313,7 +1413,7 @@ reset_generated_source_for_update() {
             || warn "Update-build stash dir not empty after restoring out cache: ${UPDATE_BUILD_STASH_DIR}"
     fi
 
-    success "Generated source refreshed from clean archive"
+    success "Generated source refreshed from the selected release"
 }
 
 series_has_entries() {
@@ -1401,7 +1501,7 @@ apply_source_customizations() {
     section "preparing Chromium source"
     explain "apply ungoogled, macOS, and local patches before the build starts"
 
-    # The source archive is raw Chromium. Prepare it in layers:
+    # The freshly retrieved source is raw Chromium. Prepare it in layers:
     # upstream ungoogled patches, macOS patches, patches.local/, then domain
     # substitution.
     info "Pruning binaries..."
@@ -1430,19 +1530,37 @@ apply_source_customizations() {
 
 write_args_gn() {
     section "writing args.gn"
-    explain "combine upstream flags with local macOS flags, then set the target CPU"
+    explain "combine upstream and local flags, then set the target CPU and selected SDK"
 
     # args.gn is generated, not hand-edited. Start from upstream flags, layer the
-    # local macOS flags, and then write target_cpu last so the configured ARCH in
-    # conductor.conf wins even if either flags file already contains a target_cpu.
-    mkdir -p "${SRC_DIR}/out/Default"
+    # local macOS flags, then set the configured CPU and the SDK that passed the
+    # downloaded LLVM link check. GN's sdk_inputs action requires an SDK link
+    # inside its output directory; bindgen uses the real SDK through SDKROOT.
+    local sdk_gn_path
+    sdk_gn_path="$(python3 - "${BUILD_SDK_PATH}" "${SRC_DIR}" "${FLAGS_OUTPUT%/*}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+sdk, source, output = (Path(value).absolute() for value in sys.argv[1:])
+link = output / 'sdk/conductor/MacOSX.sdk'
+gn_path = '//' + link.relative_to(source).as_posix()
+link.parent.mkdir(parents=True, exist_ok=True)
+if link.is_symlink() and link.readlink() != sdk:
+    link.unlink()
+if not link.is_symlink():
+    link.symlink_to(sdk, target_is_directory=True)
+print(json.dumps(gn_path).replace('$', '\\$'))
+PY
+)" || error "Could not create the selected SDK link in the build output directory"
 
     {
-        sed '/^[[:space:]]*target_cpu[[:space:]]*=.*/d' "${FLAGS_BASE}"
+        sed -E '/^[[:space:]]*(target_cpu|mac_sdk_path)[[:space:]]*=.*/d' "${FLAGS_BASE}"
         printf '\n'
-        sed '/^[[:space:]]*target_cpu[[:space:]]*=.*/d' "${FLAGS_MACOS}"
+        sed -E '/^[[:space:]]*(target_cpu|mac_sdk_path)[[:space:]]*=.*/d' "${FLAGS_MACOS}"
         printf '\n'
         printf 'target_cpu = "%s"\n' "${ARCH_GN}"
+        printf 'mac_sdk_path = %s\n' "${sdk_gn_path}"
     } > "${FLAGS_OUTPUT}"
 
     info "Wrote ${FLAGS_OUTPUT}"
@@ -1451,13 +1569,23 @@ write_args_gn() {
     done < "${FLAGS_OUTPUT}"
 }
 
+select_build_sdk() {
+    section "checking macOS SDK compatibility"
+    explain "test the downloaded LLVM linker before building bindgen or Chromium"
+
+    BUILD_SDK_PATH="$(python3 "${SCRIPT_DIR}/tools/select_macos_sdk.py" \
+        --source-dir "${SRC_DIR}" --arch "${ARCH_RESOURCE}")" || \
+        error "macOS SDK compatibility check failed"
+    export SDKROOT="${BUILD_SDK_PATH}"
+    info "Selected SDK: ${BUILD_SDK_PATH}"
+}
+
 retrieve_platform_resources() {
     section "restoring macOS build tools"
     explain "restore LLVM, Rust, and Node pieces before GN and Ninja inspect the tree"
 
-    # Toolchains are large, generated dependencies. Restore them after patching
-    # and args generation so the source tree has the expected macOS LLVM, Rust,
-    # and Node pieces before GN and Ninja inspect it.
+    # Restore the downloaded toolchains after patching so we can select an SDK
+    # they support before writing args and starting GN or Ninja.
     cd "${REPO_DIR}"
 
     info "Retrieving platform-specific resources for ${ARCH_GN}"
@@ -1469,6 +1597,10 @@ retrieve_platform_resources() {
     require_executable "${SRC_DIR}/third_party/llvm-build/Release+Asserts/bin/llvm-config"
     require_executable "${SRC_DIR}/third_party/rust-toolchain/bin/cargo"
     require_executable "${SRC_DIR}/third_party/rust-toolchain/bin/rustc"
+
+    info "Restoring the DevTools TypeScript and esbuild tools..."
+    python3 "${SCRIPT_DIR}/tools/prepare_devtools_tools.py" \
+        --source-dir "${SRC_DIR}" --cache-dir "${SCRIPT_DIR}/out/devtools-tools"
 
     success "macOS build tools are ready"
 }
@@ -1523,6 +1655,18 @@ verify_outputs() {
     require_executable "${SRC_DIR}/out/Default/chromedriver"
 
     success "Chromium.app and chromedriver are present"
+}
+
+package_existing_build() {
+    section "packaging completed build"
+    explain "copy the completed app into a verified disk image for a GitHub release"
+
+    require_file "${LAST_BUILT_VERSION_FILE}"
+    local built_tag
+    built_tag="$(tr -d '[:space:]' < "${LAST_BUILT_VERSION_FILE}")"
+    python3 "${SCRIPT_DIR}/tools/package_macos.py" \
+        --app "${SRC_DIR}/out/Default/Chromium.app" \
+        --output-dir "${SCRIPT_DIR}/out/releases" --release-tag "${built_tag}"
 }
 
 record_built_version() {
@@ -1683,10 +1827,17 @@ main() {
 
     section "preflight"
     validate_host_layout
-    migrate_legacy_state
-    load_config
+    if [[ "${MODE}" != "package" ]]; then
+        migrate_legacy_state
+        load_config
+    fi
 
     case "${MODE}" in
+        package)
+            package_existing_build
+            section "done"
+            success "Disk image packaging complete. Upload the .dmg and .sha256 from out/releases/ to GitHub Releases."
+            ;;
         check)
             # --check is read-only:
             # validate local files, ask GitHub for the latest published release,
@@ -1743,8 +1894,9 @@ main() {
             mark_source_state
 
             section "generating build files"
-            write_args_gn
             retrieve_platform_resources
+            select_build_sdk
+            write_args_gn
 
             section "building Chromium.app"
             build_from_scratch
@@ -1777,8 +1929,9 @@ main() {
             mark_source_state
 
             section "generating build files"
-            write_args_gn
             retrieve_platform_resources
+            select_build_sdk
+            write_args_gn
 
             section "building Chromium.app"
             build_from_scratch
